@@ -1,4 +1,4 @@
-To use: Create a new function in open-webui and copy pipe code in; set system prompt to your existing gemma3:12b settings in open-webui; set SEARCH_URL in the valve settings, I use "http://192.168.1.1:8888/search?q=" for my searxng instance. There are a bunch of other valve settings, todo explain them better. See below for example output
+To use: Create a new function in open-webui and copy pipe code in; set system prompt to your existing gemma3:12b settings in open-webui; set SEARCH_URL in the valve settings, I use "http://192.168.1.1:8888/search?q=" for my searxng instance; pip install PyPDF2 pdfplumber in your open-webui venv; set SYNTHESIS_MODEL to gemma3:27b if you have the capacity with context. There are a bunch of other valve settings, todo explain them better. See below for example output
 
 -
 
