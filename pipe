@@ -46,6 +46,10 @@ class Pipe:
             default="gemma3:12b",
             description="Model for generating research queries and synthesizing results",
         )
+        SYNTHESIS_MODEL: str = Field(
+            default="",
+            description="Optional separate model for final synthesis (leave empty to use LARGE_MODEL)",
+        )
         EMBEDDING_MODEL: str = Field(
             default="granite-embedding:30m",
             description="Model for semantic comparison of content",
@@ -57,7 +61,7 @@ class Pipe:
             le=50,
         )
         MIN_CYCLES: int = Field(
-            default=3,
+            default=5,
             description="Minimum number of research cycles to perform",
             ge=1,
             le=10,
@@ -95,11 +99,14 @@ class Pipe:
         TEMPERATURE: float = Field(
             default=0.7, description="Temperature for generation", ge=0.0, le=2.0
         )
+        SYNTHESIS_TEMPERATURE: float = Field(
+            default=0.6, description="Temperature for final synthesis", ge=0.0, le=2.0
+        )
         OLLAMA_URL: str = Field(
             default="http://localhost:11434", description="URL for Ollama API"
         )
         SEARCH_URL: str = Field(
-            default="",
+            default="http://192.168.1.1:8888/search?q=",
             description="URL for web search API",
         )
         MAX_FAILED_RESULTS: int = Field(
@@ -111,6 +118,16 @@ class Pipe:
         EXTRACT_CONTENT_ONLY: bool = Field(
             default=True,
             description="Extract only text content from HTML, removing scripts, styles, etc.",
+        )
+        PDF_MAX_PAGES: int = Field(
+            default=50,
+            description="Maximum number of pages to extract from a PDF",
+            ge=5,
+            le=500,
+        )
+        HANDLE_PDFS: bool = Field(
+            default=True,
+            description="Enable processing of PDF files",
         )
 
     def __init__(self):
@@ -566,9 +583,18 @@ class Pipe:
                 content = await asyncio.wait_for(fetch_task, timeout=20.0)
 
                 if content:
+                    # Check if this is a PDF by examining content
+                    if content.startswith(b"%PDF") or (
+                        isinstance(content, str) and content.startswith("%PDF")
+                    ):
+                        logger.info(f"Detected PDF content from URL: {url}")
+                        return await self.extract_text_from_pdf(content)
+
                     # If extract_content_only is true, extract just the text
-                    if self.valves.EXTRACT_CONTENT_ONLY and content.strip().startswith(
-                        "<"
+                    if (
+                        self.valves.EXTRACT_CONTENT_ONLY
+                        and isinstance(content, str)
+                        and content.strip().startswith("<")
                     ):
                         extracted = await self.extract_text_from_html(content)
                         return extracted
@@ -583,26 +609,160 @@ class Pipe:
             async with aiohttp.ClientSession() as session:
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept": "text/html,application/xhtml+xml,application/xml,application/pdf;q=0.9,image/webp,*/*;q=0.8",
                     "Accept-Language": "en-US,en;q=0.5",
                 }
-                async with session.get(url, headers=headers, timeout=20.0) as response:
-                    if response.status == 200:
-                        content = await response.text()
-                        # If extract_content_only is true, extract just the text
-                        if (
-                            self.valves.EXTRACT_CONTENT_ONLY
-                            and content.strip().startswith("<")
-                        ):
-                            extracted = await self.extract_text_from_html(content)
-                            return extracted
-                        return content
+
+                # Check if URL appears to be a PDF
+                is_pdf = url.lower().endswith(".pdf")
+
+                if is_pdf:
+                    # Use binary mode for PDFs
+                    async with session.get(
+                        url, headers=headers, timeout=20.0
+                    ) as response:
+                        if response.status == 200:
+                            # Get PDF content as bytes
+                            pdf_content = await response.read()
+                            return await self.extract_text_from_pdf(pdf_content)
+                else:
+                    # Normal text/HTML mode
+                    async with session.get(
+                        url, headers=headers, timeout=20.0
+                    ) as response:
+                        if response.status == 200:
+                            # Check content type in response headers
+                            content_type = response.headers.get(
+                                "Content-Type", ""
+                            ).lower()
+
+                            if "application/pdf" in content_type:
+                                # This is a PDF even though the URL didn't end with .pdf
+                                pdf_content = await response.read()
+                                return await self.extract_text_from_pdf(pdf_content)
+
+                            # Handle as normal HTML/text
+                            content = await response.text()
+                            if (
+                                self.valves.EXTRACT_CONTENT_ONLY
+                                and content.strip().startswith("<")
+                            ):
+                                extracted = await self.extract_text_from_html(content)
+                                return extracted
+                            return content
         except asyncio.TimeoutError:
             logger.error(f"Timeout fetching content from {url}")
             return f"Timeout while fetching content from {url}"
         except Exception as e:
             logger.error(f"Error fetching content from {url}: {e}")
             return f"Error fetching content: {str(e)}"
+
+    async def extract_text_from_pdf(self, pdf_content) -> str:
+        """Extract text from PDF content using PyPDF2 or pdfplumber"""
+        if not self.valves.HANDLE_PDFS:
+            return "PDF processing is disabled in settings."
+
+        # Ensure we have bytes for the PDF content
+        if isinstance(pdf_content, str):
+            if pdf_content.startswith("%PDF"):
+                pdf_content = pdf_content.encode("utf-8", errors="ignore")
+            else:
+                return "Error: Invalid PDF content format"
+
+        # Limit extraction to configured max pages to avoid too much processing
+        max_pages = self.valves.PDF_MAX_PAGES
+
+        try:
+            # Try PyPDF2 first
+            try:
+                import io
+                from PyPDF2 import PdfReader
+
+                # Create a reader object
+                pdf_file = io.BytesIO(pdf_content)
+                pdf_reader = PdfReader(pdf_file)
+
+                # Get the total number of pages
+                num_pages = len(pdf_reader.pages)
+                logger.info(f"PDF has {num_pages} pages, extracting up to {max_pages}")
+
+                # Extract text from each page up to the limit
+                text = []
+                for page_num in range(min(num_pages, max_pages)):
+                    try:
+                        page = pdf_reader.pages[page_num]
+                        page_text = page.extract_text() or ""
+                        if page_text.strip():
+                            text.append(f"Page {page_num + 1}:\n{page_text}")
+                    except Exception as e:
+                        logger.warning(f"Error extracting page {page_num}: {e}")
+
+                # Join all pages with spacing
+                full_text = "\n\n".join(text)
+
+                if full_text.strip():
+                    logger.info(
+                        f"Successfully extracted text from PDF using PyPDF2: {len(full_text)} chars"
+                    )
+                    # Add a note if we limited the page count
+                    if num_pages > max_pages:
+                        full_text += f"\n\n[Note: This PDF has {num_pages} pages, but only the first {max_pages} were processed.]"
+                    return full_text
+                else:
+                    logger.warning(
+                        "PyPDF2 extraction returned empty text, trying pdfplumber..."
+                    )
+            except (ImportError, Exception) as e:
+                logger.warning(f"PyPDF2 extraction failed: {e}, trying pdfplumber...")
+
+            # Try pdfplumber as a fallback
+            try:
+                import io
+                import pdfplumber
+
+                pdf_file = io.BytesIO(pdf_content)
+                with pdfplumber.open(pdf_file) as pdf:
+                    # Get total pages
+                    num_pages = len(pdf.pages)
+
+                    text = []
+                    for i, page in enumerate(pdf.pages[:max_pages]):
+                        try:
+                            page_text = page.extract_text() or ""
+                            if page_text.strip():
+                                text.append(f"Page {i + 1}:\n{page_text}")
+                        except Exception as page_error:
+                            logger.warning(
+                                f"Error extracting page {i} with pdfplumber: {page_error}"
+                            )
+
+                full_text = "\n\n".join(text)
+
+                if full_text.strip():
+                    logger.info(
+                        f"Successfully extracted text from PDF using pdfplumber: {len(full_text)} chars"
+                    )
+                    # Add a note if we limited the page count
+                    if num_pages > max_pages:
+                        full_text += f"\n\n[Note: This PDF has {num_pages} pages, but only the first {max_pages} were processed.]"
+                    return full_text
+                else:
+                    logger.warning("pdfplumber extraction returned empty text")
+            except (ImportError, Exception) as e:
+                logger.warning(f"pdfplumber extraction failed: {e}")
+
+            # If both methods failed but we can tell it's a PDF, provide a more useful message
+            if pdf_content.startswith(b"%PDF"):
+                logger.warning(
+                    "PDF detected but text extraction failed. May be scanned or encrypted."
+                )
+                return "This appears to be a PDF document, but text extraction failed. The PDF may contain scanned images rather than text, or it may be encrypted/protected."
+
+            return "Could not extract text from PDF. The file may not be a valid PDF or may contain security restrictions."
+
+        except Exception as e:
+            logger.error(f"PDF text extraction failed: {e}")
+            return f"Error extracting text from PDF: {str(e)}"
 
     async def sanitize_query(self, query: str) -> str:
         """Sanitize search query by removing quotes and handling special characters"""
@@ -1378,13 +1538,27 @@ Format your response as a valid JSON object with the following structure:
                 False,
             )
 
-        # Step 7: Synthesize final answer with the large model
+        # Step 7: Synthesize final answer with the selected model
         await self.emit_status(
             "info", "Synthesizing comprehensive answer from research results...", False
         )
         await self.emit_message(
             "\n\n---\n\n### Research Complete\n\nSynthesizing comprehensive answer...\n\n"
         )
+
+        # Determine which model to use for synthesis
+        synthesis_model = self.valves.LARGE_MODEL
+        if (
+            self.valves.SYNTHESIS_MODEL
+            and self.valves.SYNTHESIS_MODEL != self.valves.LARGE_MODEL
+        ):
+            synthesis_model = self.valves.SYNTHESIS_MODEL
+            await self.emit_message(
+                f"*Using {synthesis_model} for final synthesis*\n\n"
+            )
+
+            # Note: We're not trying to unload the previous model as that's causing issues
+            # The Ollama server will manage the models as needed
 
         # Prepare synthesis prompt with all gathered information
         synthesis_prompt = {
@@ -1394,13 +1568,13 @@ Based on the user's original query and the information gathered during research,
 create a highly-detailed, well-organized response that thoroughly answers the query and uses all of the research.
 
 Your synthesis should:
-1. Be comprehensive and directly address the user's query
+1. Be comprehensive in answering the user's query based on every single available research point
 2. Organize information logically by topic
-3. Include relevant details from the research
+3. Include all relevant details from the research
 4. Cite sources where appropriate using footnotes or inline citations
 5. Identify any areas where information was limited or unavailable
 
-The user will only see your final synthesis, not the research process, so make it complete.""",
+The user will only see your final synthesis, not the research process, so make it complete and thorough.""",
         }
 
         # Build context from all search results
@@ -1436,15 +1610,17 @@ The user will only see your final synthesis, not the research process, so make i
         # Generate the final synthesis
         try:
             await self.emit_status(
-                "info", "Generating final comprehensive answer...", False
+                "info",
+                f"Generating final comprehensive answer with {synthesis_model}...",
+                False,
             )
 
             # Stream the response for a better user experience
             form_data = {
-                "model": self.valves.LARGE_MODEL,
+                "model": synthesis_model,
                 "messages": synthesis_messages,
                 "stream": True,
-                "temperature": self.valves.TEMPERATURE,
+                "temperature": self.valves.SYNTHESIS_TEMPERATURE,
             }
 
             response = await generate_chat_completions(
@@ -1492,7 +1668,7 @@ The user will only see your final synthesis, not the research process, so make i
         except Exception as e:
             logger.error(f"Error generating synthesis: {e}")
             await self.emit_message(
-                "*Error generating final synthesis. Please review the research results above.*\n\n"
+                f"*Error generating final synthesis with {synthesis_model}. Please review the research results above.*\n\n"
             )
 
         # Complete the process
