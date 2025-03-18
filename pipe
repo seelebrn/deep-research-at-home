@@ -72,6 +72,12 @@ class Pipe:
             ge=1,
             le=10,
         )
+        EXTRA_RESULTS_PER_QUERY: int = Field(
+            default=2,
+            description="Extra results to fetch and select the most relevant from",
+            ge=0,
+            le=5,
+        )
         SUCCESSFUL_RESULTS_PER_QUERY: int = Field(
             default=1,
             description="Number of successful results to keep per query",
@@ -85,7 +91,7 @@ class Pipe:
             le=10,
         )
         COMPRESSION_LEVEL: int = Field(
-            default=5,
+            default=4,
             description="Level of compression (1=minimal, 10=maximum)",
             ge=1,
             le=10,
@@ -93,6 +99,12 @@ class Pipe:
         QUERY_WEIGHT: float = Field(
             default=0.5,
             description="Weight to give query similarity vs document relevance (0.0-1.0)",
+            ge=0.0,
+            le=1.0,
+        )
+        FOLLOWUP_WEIGHT: float = Field(
+            default=0.5,
+            description="Weight to give followup query vs previous comprehensive summary (0.0-1.0)",
             ge=0.0,
             le=1.0,
         )
@@ -129,10 +141,17 @@ class Pipe:
             default=True,
             description="Enable processing of PDF files",
         )
+        RELEVANCY_SNIPPET_LENGTH: int = Field(
+            default=1000,
+            description="Number of characters to use when comparing extra results for relevance",
+            ge=100,
+            le=5000,
+        )
 
     def __init__(self):
         self.type = "manifold"
         self.valves = self.Valves()
+        self.prev_comprehensive_summary = ""  # Store the previous comprehensive answer
 
     def pipes(self) -> list[dict[str, str]]:
         return [{"id": f"{name}-pipe", "name": f"{name} Pipe"}]
@@ -228,11 +247,17 @@ class Pipe:
 
         return chunks
 
-    async def compress_content(self, content: str, query_embedding: List[float]) -> str:
+    async def compress_content(
+        self,
+        content: str,
+        query_embedding: List[float],
+        summary_embedding: Optional[List[float]] = None,
+    ) -> str:
         """Apply semantic compression to content based on chunk level and compression level"""
         chunk_level = self.valves.CHUNK_LEVEL
         compression_level = self.valves.COMPRESSION_LEVEL
         query_weight = self.valves.QUERY_WEIGHT
+        followup_weight = self.valves.FOLLOWUP_WEIGHT
 
         # Skip compression for very short content
         if len(content) < 100:
@@ -307,7 +332,20 @@ class Pipe:
                     0
                 ]
 
-                # Weight the scores
+                # Calculate similarity to previous summary if we have one and we're in follow-up mode
+                summary_similarity = 0.0
+                if summary_embedding is not None:
+                    summary_similarity = cosine_similarity(
+                        [embedding], [summary_embedding]
+                    )[0][0]
+
+                    # If we have both query and summary embeddings, use followup_weight to balance them
+                    # Otherwise, just use query_similarity
+                    weighted_query_sim = query_similarity * followup_weight
+                    weighted_summary_sim = summary_similarity * (1.0 - followup_weight)
+                    query_similarity = weighted_query_sim + weighted_summary_sim
+
+                # Weight the scores - document vs query similarity
                 doc_weight = 1.0 - query_weight
                 final_score = (doc_similarity * doc_weight) + (
                     query_similarity * query_weight
@@ -382,7 +420,10 @@ class Pipe:
 
                     # Create a result object for each document
                     for i, doc in enumerate(
-                        docs[: self.valves.SEARCH_RESULTS_PER_QUERY]
+                        docs[
+                            : self.valves.SEARCH_RESULTS_PER_QUERY
+                            + self.valves.EXTRA_RESULTS_PER_QUERY
+                        ]
                     ):
                         url = urls[i] if i < len(urls) else ""
                         results.append(
@@ -402,7 +443,10 @@ class Pipe:
                     )
 
                     for i, url in enumerate(
-                        urls[: self.valves.SEARCH_RESULTS_PER_QUERY]
+                        urls[
+                            : self.valves.SEARCH_RESULTS_PER_QUERY
+                            + self.valves.EXTRA_RESULTS_PER_QUERY
+                        ]
                     ):
                         results.append(
                             {
@@ -441,7 +485,10 @@ class Pipe:
 
                         if isinstance(search_json, list):
                             for i, item in enumerate(
-                                search_json[: self.valves.SEARCH_RESULTS_PER_QUERY]
+                                search_json[
+                                    : self.valves.SEARCH_RESULTS_PER_QUERY
+                                    + self.valves.EXTRA_RESULTS_PER_QUERY
+                                ]
                             ):
                                 results.append(
                                     {
@@ -454,6 +501,7 @@ class Pipe:
                             for i, item in enumerate(
                                 search_json["results"][
                                     : self.valves.SEARCH_RESULTS_PER_QUERY
+                                    + self.valves.EXTRA_RESULTS_PER_QUERY
                                 ]
                             ):
                                 results.append(
@@ -606,7 +654,29 @@ class Pipe:
 
             # Direct fetch as fallback
             logger.debug(f"Using direct fetch for URL: {url}")
-            async with aiohttp.ClientSession() as session:
+
+            # Create a ClientSession with SSL verification disabled for problematic sites
+            ssl_context = None
+            if "ssl:" in url or url.startswith("https://"):
+                try:
+                    import ssl
+
+                    # Create a default SSL context
+                    ssl_context = ssl.create_default_context()
+                    # But make it less strict if needed
+                    if url.endswith(".org") or "certificate" in url.lower():
+                        ssl_context.check_hostname = False
+                        ssl_context.verify_mode = ssl.CERT_NONE
+                        logger.info(f"Using relaxed SSL verification for URL: {url}")
+                except ImportError:
+                    logger.warning(
+                        "SSL module not available, proceeding without SSL context"
+                    )
+
+            # Create a connector with the SSL context
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+
+            async with aiohttp.ClientSession(connector=connector) as session:
                 headers = {
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36",
                     "Accept": "text/html,application/xhtml+xml,application/xml,application/pdf;q=0.9,image/webp,*/*;q=0.8",
@@ -619,7 +689,7 @@ class Pipe:
                 if is_pdf:
                     # Use binary mode for PDFs
                     async with session.get(
-                        url, headers=headers, timeout=20.0
+                        url, headers=headers, timeout=20.0, verify_ssl=False
                     ) as response:
                         if response.status == 200:
                             # Get PDF content as bytes
@@ -628,7 +698,7 @@ class Pipe:
                 else:
                     # Normal text/HTML mode
                     async with session.get(
-                        url, headers=headers, timeout=20.0
+                        url, headers=headers, timeout=20.0, verify_ssl=False
                     ) as response:
                         if response.status == 200:
                             # Check content type in response headers
@@ -780,7 +850,11 @@ class Pipe:
         return sanitized
 
     async def process_search_result(
-        self, result: Dict, query: str, query_embedding: List[float]
+        self,
+        result: Dict,
+        query: str,
+        query_embedding: List[float],
+        summary_embedding: Optional[List[float]] = None,
     ) -> Dict:
         """Process a search result to extract and compress content"""
         title = result.get("title", "")
@@ -831,8 +905,8 @@ Include all relevant facts, figures, and information.
 Format your summary with clear paragraphs and appropriate organization.""",
                     }
 
-                    # Use up to 10,000 characters of the content for summarization
-                    content_length = min(10000, len(snippet))
+                    # Use up to 30,000 characters of the content for summarization
+                    content_length = min(30000, len(snippet))
 
                     summary_messages = [
                         summary_prompt,
@@ -883,7 +957,7 @@ Format your summary with clear paragraphs and appropriate organization.""",
             # Fall back to semantic compression
             try:
                 compressed_content = await self.compress_content(
-                    snippet, query_embedding
+                    snippet, query_embedding, summary_embedding
                 )
 
                 # Use compressed content if available, otherwise use original (but limited)
@@ -968,8 +1042,97 @@ Format your summary with clear paragraphs and appropriate organization.""",
             }
         )
 
+    async def select_most_relevant_results(
+        self,
+        results: List[Dict],
+        query: str,
+        query_embedding: List[float],
+        summary_embedding: Optional[List[float]] = None,
+    ) -> List[Dict]:
+        """Select the most relevant results from extra results pool"""
+        if not results or len(results) <= self.valves.SEARCH_RESULTS_PER_QUERY:
+            return results
+
+        # If we have extra results, compute their relevance scores
+        relevant_scores = []
+
+        for i, result in enumerate(results):
+            try:
+                # Get a snippet of content to evaluate
+                snippet = result.get("snippet", "")
+                if not snippet and result.get("url"):
+                    # Try to fetch a small amount of content for evaluation
+                    try:
+                        await self.emit_status(
+                            "info",
+                            f"Fetching snippet from {result['url'][:30]}...",
+                            False,
+                        )
+                        snippet_content = await self.fetch_content(result["url"])
+                        if snippet_content:
+                            snippet = snippet_content[
+                                : self.valves.RELEVANCY_SNIPPET_LENGTH
+                            ]
+                    except Exception as e:
+                        logger.error(f"Error fetching content for relevance check: {e}")
+
+                # If we have content, get its embedding and calculate similarity
+                if snippet and len(snippet) > 100:
+                    snippet_embedding = await self.get_embedding(
+                        snippet[: self.valves.RELEVANCY_SNIPPET_LENGTH]
+                    )
+
+                    if snippet_embedding:
+                        # Calculate similarity to query
+                        query_sim = cosine_similarity(
+                            [snippet_embedding], [query_embedding]
+                        )[0][0]
+
+                        # Calculate similarity to summary if provided
+                        summary_sim = 0.0
+                        if summary_embedding is not None:
+                            summary_sim = cosine_similarity(
+                                [snippet_embedding], [summary_embedding]
+                            )[0][0]
+
+                            # For follow-up queries, use the followup_weight to balance
+                            followup_weight = (
+                                self.valves.FOLLOWUP_WEIGHT * 1.3
+                            )  # Apply the 1.3x factor as requested
+                            query_sim = (query_sim * followup_weight) + (
+                                summary_sim * (1.0 - followup_weight)
+                            )
+
+                        relevant_scores.append((i, query_sim))
+                    else:
+                        # No embedding, assign a low score
+                        relevant_scores.append((i, 0.1))
+                else:
+                    # No content, assign a low score
+                    relevant_scores.append((i, 0.0))
+            except Exception as e:
+                logger.error(f"Error calculating relevance for result {i}: {e}")
+                relevant_scores.append((i, 0.0))
+
+        # Sort by relevance score (highest first)
+        relevant_scores.sort(key=lambda x: x[1], reverse=True)
+
+        # Select the top N results
+        selected_indices = [
+            x[0] for x in relevant_scores[: self.valves.SEARCH_RESULTS_PER_QUERY]
+        ]
+        selected_results = [results[i] for i in selected_indices if i < len(results)]
+
+        logger.info(
+            f"Selected {len(selected_results)} most relevant results from {len(results)} total results"
+        )
+        return selected_results
+
     async def process_query(
-        self, query: str, query_embedding: List[float]
+        self,
+        query: str,
+        query_embedding: List[float],
+        summary_embedding: Optional[List[float]] = None,
     ) -> List[Dict]:
         """Process a single search query and get results"""
         await self.emit_status("info", f"Searching for: {query}", False)
@@ -979,6 +1142,12 @@ Format your summary with clear paragraphs and appropriate organization.""",
         if not search_results:
             await self.emit_message(f"*No results found for query: {query}*\n\n")
             return []
+
+        # If we have extra results enabled, select the most relevant
+        if self.valves.EXTRA_RESULTS_PER_QUERY > 0:
+            search_results = await self.select_most_relevant_results(
+                search_results, query, query_embedding, summary_embedding
+            )
 
         # Process each search result until we have enough successful results
         successful_results = []
@@ -999,7 +1168,7 @@ Format your summary with clear paragraphs and appropriate organization.""",
             try:
                 # Process the result
                 processed_result = await self.process_search_result(
-                    result, query, query_embedding
+                    result, query, query_embedding, summary_embedding
                 )
 
                 # Check if processing was successful (has substantial content)
@@ -1042,6 +1211,14 @@ Format your summary with clear paragraphs and appropriate organization.""",
 
         return successful_results
 
+    async def is_follow_up_query(self, messages: List[Dict]) -> bool:
+        """Determine if the current query is a follow-up to a previous research session"""
+        # Simple detection: if there are multiple messages and the previous one has our comprehensive answer,
+        # it's a follow-up
+        if len(messages) > 1 and self.prev_comprehensive_summary:
+            return True
+        return False
+
     async def pipe(
         self,
         body: dict,
@@ -1060,16 +1237,45 @@ Format your summary with clear paragraphs and appropriate organization.""",
         if not self.valves.ENABLED or (__task__ and __task__ != TASKS.DEFAULT):
             return ""
 
-        # Get user query from the messages
-        user_message = body.get("messages", [])[-1].get("content", "").strip()
+        # Get messages from the body
+        messages = body.get("messages", [])
+        if not messages:
+            return ""
+
+        # Get user query from the latest message
+        user_message = messages[-1].get("content", "").strip()
         if not user_message:
             return ""
 
-        await self.emit_status("info", "Starting deep research...", False)
-        await self.emit_message("## Deep Research Mode: Activated\n\n")
-        await self.emit_message(
-            "I'll search for comprehensive information about your query. This might take a moment...\n\n"
-        )
+        # Check if this is a follow-up query
+        is_follow_up = await self.is_follow_up_query(messages)
+
+        # Get summary embedding if this is a follow-up
+        summary_embedding = None
+        if is_follow_up and self.prev_comprehensive_summary:
+            try:
+                await self.emit_status("info", "Processing follow-up query...", False)
+                summary_embedding = await self.get_embedding(
+                    self.prev_comprehensive_summary
+                )
+                await self.emit_message("## Deep Research Mode: Follow-up\n\n")
+                await self.emit_message(
+                    "I'll continue researching based on your follow-up query while considering our previous findings.\n\n"
+                )
+            except Exception as e:
+                logger.error(f"Error getting summary embedding: {e}")
+                # Continue without the summary embedding if there's an error
+                is_follow_up = False
+                await self.emit_message("## Deep Research Mode: Activated\n\n")
+                await self.emit_message(
+                    "I'll search for comprehensive information about your query. This might take a moment...\n\n"
+                )
+        else:
+            await self.emit_status("info", "Starting deep research...", False)
+            await self.emit_message("## Deep Research Mode: Activated\n\n")
+            await self.emit_message(
+                "I'll search for comprehensive information about your query. This might take a moment...\n\n"
+            )
 
         # Step 1: Generate initial search queries based only on user query
         await self.emit_status("info", "Generating initial search queries...", False)
@@ -1088,13 +1294,23 @@ Format your response as a valid JSON object with the following structure:
 ]}""",
         }
 
-        initial_query_messages = [
-            initial_query_prompt,
-            {
-                "role": "user",
-                "content": f"Generate initial search queries for: {user_message}",
-            },
-        ]
+        # If this is a follow-up, include the previous summary in context
+        if is_follow_up and self.prev_comprehensive_summary:
+            initial_query_messages = [
+                initial_query_prompt,
+                {
+                    "role": "user",
+                    "content": f"Generate initial search queries for this follow-up question: {user_message}\n\nPrevious research summary:\n{self.prev_comprehensive_summary[:2000]}...",
+                },
+            ]
+        else:
+            initial_query_messages = [
+                initial_query_prompt,
+                {
+                    "role": "user",
+                    "content": f"Generate initial search queries for: {user_message}",
+                },
+            ]
 
         # Get initial search queries
         query_response = await self.generate_completion(
@@ -1143,7 +1359,9 @@ Format your response as a valid JSON object with the following structure:
                 query_embedding = [0] * 384  # Default embedding size
 
             # Process the query and get results
-            results = await self.process_query(query, query_embedding)
+            results = await self.process_query(
+                query, query_embedding, summary_embedding
+            )
 
             # Add successful results to our collection
             initial_results.extend(results)
@@ -1195,6 +1413,11 @@ Format your response as a valid JSON object with the following structure:
             outline_context += f"Result {i+1} (Query: '{result['query']}')\n"
             outline_context += f"Title: {result['title']}\n"
             outline_context += f"Content: {result['content'][:1000]}...\n\n"
+
+        # Include previous comprehensive summary if this is a follow-up
+        if is_follow_up and self.prev_comprehensive_summary:
+            outline_context += "### Previous Research Summary:\n\n"
+            outline_context += f"{self.prev_comprehensive_summary[:2000]}...\n\n"
 
         outline_messages = [
             outline_prompt,
@@ -1255,9 +1478,14 @@ Format your response as a valid JSON object with the following structure:
         max_cycles = self.valves.MAX_CYCLES
         min_cycles = self.valves.MIN_CYCLES
         completed_topics = set()
+        irrelevant_topics = set()  # New set to track irrelevant topics
         search_history = initial_queries.copy()
         results_history = initial_results.copy()
         active_outline = list(all_topics)  # Topics that still need research
+        cycle_summaries = []  # Store all cycle summaries for context
+
+        # Track the most recent two checklists (each containing all topics)
+        recent_checklists = []
 
         # Step 4: Begin research cycles
         while cycle < max_cycles and active_outline:
@@ -1310,6 +1538,17 @@ Format your response as a valid JSON object with the following structure:
             search_context += "### Research topics still needing information:\n"
             for topic in active_outline[:10]:  # Limit to first 10 for clarity
                 search_context += f"- {topic}\n"
+
+            # Include previous cycle summaries
+            if cycle_summaries:
+                search_context += "\n### Previous cycle summaries:\n"
+                for i, summary in enumerate(cycle_summaries):
+                    search_context += f"Cycle {i+1} Summary: {summary}\n\n"
+
+            # Include previous comprehensive summary if this is a follow-up
+            if is_follow_up and self.prev_comprehensive_summary:
+                search_context += "### Previous Research Summary:\n\n"
+                search_context += f"{self.prev_comprehensive_summary[:1000]}...\n\n"
 
             query_messages = [
                 query_prompt,
@@ -1380,7 +1619,9 @@ Format your response as a valid JSON object with the following structure:
                     query_embedding = [0] * 384  # Default embedding size
 
                 # Process the query and get results
-                results = await self.process_query(query, query_embedding)
+                results = await self.process_query(
+                    query, query_embedding, summary_embedding
+                )
 
                 # Add successful results to the cycle results and history
                 cycle_results.extend(results)
@@ -1399,12 +1640,23 @@ Format your response as a valid JSON object with the following structure:
                     "content": """You are a research assistant analyzing search results and updating a research outline.
 Examine the search results and the current research outline.
 Determine which topics have been adequately addressed by the search results.
-Update the research outline by removing topics that have been sufficiently covered.
+Update the research outline by classifying topics into different categories.
+
+Topics should be classified as:
+- COMPLETED: Topics that have been fully addressed with comprehensive information.
+- PARTIAL: Topics that have some information but need more research.
+- IRRELEVANT: Topics that are not actually relevant to the main query, are red herrings, 
+  based on misidentified subjects, or are technical artifacts rather than substantive topics.
+  For example, mark as irrelevant any topics about unrelated subjects that were mistakenly
+  included due to ambiguous terms, acronyms with multiple meanings, or page elements from
+  websites that don't relate to the actual query.
+- NEW: New topics discovered in the search results that should be added to the research.
 
 Format your response as a valid JSON object with the following structure:
 {
   "completed_topics": ["Topic 1", "Subtopic 2.1"],
   "partial_topics": ["Topic 2"],
+  "irrelevant_topics": ["Topic that's a distraction", "Misidentified subject"],
   "new_topics": ["New topic discovered"],
   "analysis": "Brief analysis of what we've learned and what still needs research"
 }""",
@@ -1421,6 +1673,23 @@ Format your response as a valid JSON object with the following structure:
                     analysis_context += f"Result {i+1} (Query: '{result['query']}')\n"
                     analysis_context += f"Title: {result['title']}\n"
                     analysis_context += f"Content: {result['content'][:1000]}...\n\n"
+
+                # Include previous cycle summaries for continuity
+                if cycle_summaries:
+                    analysis_context += "\n### Previous cycle summaries:\n"
+                    for i, summary in enumerate(cycle_summaries):
+                        analysis_context += f"Cycle {i+1} Summary: {summary}\n\n"
+
+                # Include lists of completed and irrelevant topics
+                if completed_topics:
+                    analysis_context += "\n### Already completed topics:\n"
+                    for topic in completed_topics:
+                        analysis_context += f"- {topic}\n"
+
+                if irrelevant_topics:
+                    analysis_context += "\n### Already identified irrelevant topics:\n"
+                    for topic in irrelevant_topics:
+                        analysis_context += f"- {topic}\n"
 
                 analysis_messages = [
                     analysis_prompt,
@@ -1448,19 +1717,47 @@ Format your response as a valid JSON object with the following structure:
                     newly_completed = set(analysis_data.get("completed_topics", []))
                     completed_topics.update(newly_completed)
 
+                    # Update irrelevant topics - NEW
+                    newly_irrelevant = set(analysis_data.get("irrelevant_topics", []))
+                    irrelevant_topics.update(newly_irrelevant)
+
                     # Add any new topics discovered
                     new_topics = analysis_data.get("new_topics", [])
                     for topic in new_topics:
-                        if topic not in all_topics and topic not in completed_topics:
+                        if (
+                            topic not in all_topics
+                            and topic not in completed_topics
+                            and topic not in irrelevant_topics
+                        ):
                             active_outline.append(topic)
                             all_topics.append(topic)
 
-                    # Update active outline by removing completed topics
+                    # Update active outline by removing completed and irrelevant topics
                     active_outline = [
                         topic
                         for topic in active_outline
                         if topic not in completed_topics
+                        and topic not in irrelevant_topics
                     ]
+
+                    # Save the analysis summary
+                    cycle_summaries.append(
+                        analysis_data.get("analysis", f"Analysis for cycle {cycle}")
+                    )
+
+                    # Create the current checklist for display to the user
+                    current_checklist = {
+                        "completed": newly_completed,
+                        "partial": set(analysis_data.get("partial_topics", [])),
+                        "irrelevant": newly_irrelevant,
+                        "new": set(new_topics),
+                        "remaining": set(active_outline),
+                    }
+
+                    # Add to recent checklists, keeping only the most recent two
+                    recent_checklists.append(current_checklist)
+                    if len(recent_checklists) > 2:
+                        recent_checklists.pop(0)
 
                     # Display analysis to the user
                     analysis_text = f"### Research Analysis (Cycle {cycle})\n\n"
@@ -1476,6 +1773,13 @@ Format your response as a valid JSON object with the following structure:
                         analysis_text += "**Topics Partially Addressed:**\n"
                         for topic in analysis_data.get("partial_topics"):
                             analysis_text += f"⚪ {topic}\n"
+                        analysis_text += "\n"
+
+                    # Add display for irrelevant topics - NEW
+                    if newly_irrelevant:
+                        analysis_text += "**Irrelevant/Distraction Topics:**\n"
+                        for topic in newly_irrelevant:
+                            analysis_text += f"✗ {topic}\n"
                         analysis_text += "\n"
 
                     if new_topics:
@@ -1507,6 +1811,8 @@ Format your response as a valid JSON object with the following structure:
                         await self.emit_message(
                             f"**Topic Addressed:** {completed_topic}\n\n"
                         )
+                        # Add minimal analysis to cycle summaries
+                        cycle_summaries.append(f"Completed topic: {completed_topic}")
 
             # Check termination criteria
             if not active_outline or active_outline == []:
@@ -1557,9 +1863,6 @@ Format your response as a valid JSON object with the following structure:
                 f"*Using {synthesis_model} for final synthesis*\n\n"
             )
 
-            # Note: We're not trying to unload the previous model as that's causing issues
-            # The Ollama server will manage the models as needed
-
         # Prepare synthesis prompt with all gathered information
         synthesis_prompt = {
             "role": "system",
@@ -1577,12 +1880,13 @@ Your synthesis should:
 The user will only see your final synthesis, not the research process, so make it complete and thorough.""",
         }
 
-        # Build context from all search results
+        # Build context from all search results and cycle summaries
         synthesis_context = "### Research Outline:\n"
         for topic in research_outline:
             synthesis_context += f"**{topic['topic']}**\n"
             for subtopic in topic.get("subtopics", []):
-                synthesis_context += f"- {subtopic}\n"
+                if subtopic not in irrelevant_topics:  # Skip irrelevant topics
+                    synthesis_context += f"- {subtopic}\n"
             synthesis_context += "\n"
 
         synthesis_context += "### Research Results:\n\n"
@@ -1591,13 +1895,25 @@ The user will only see your final synthesis, not the research process, so make i
             synthesis_context += f"Query: {result['query']}\n"
             synthesis_context += f"Content: {result['content'][:1000]}...\n\n"
 
+        # Include cycle summaries
+        if cycle_summaries:
+            synthesis_context += "### Cycle Summaries:\n\n"
+            for i, summary in enumerate(cycle_summaries):
+                synthesis_context += f"Cycle {i+1}: {summary}\n\n"
+
         # Include stats on completed vs. total topics
         synthesis_context += f"### Research Stats:\n"
         synthesis_context += (
             f"- Completed Topics: {len(completed_topics)}/{len(all_topics)}\n"
         )
+        synthesis_context += f"- Irrelevant Topics: {len(irrelevant_topics)}\n"
         synthesis_context += f"- Research Cycles: {cycle}/{max_cycles}\n"
         synthesis_context += f"- Total Results Analyzed: {len(results_history)}\n\n"
+
+        # Include previous research summary if this is a follow-up
+        if is_follow_up and self.prev_comprehensive_summary:
+            synthesis_context += "### Previous Research Summary:\n\n"
+            synthesis_context += f"{self.prev_comprehensive_summary[:2000]}...\n\n"
 
         synthesis_messages = [
             synthesis_prompt,
@@ -1608,6 +1924,7 @@ The user will only see your final synthesis, not the research process, so make i
         ]
 
         # Generate the final synthesis
+        comprehensive_answer = ""
         try:
             await self.emit_status(
                 "info",
@@ -1650,7 +1967,9 @@ The user will only see your final synthesis, not the research process, so make i
                             ):
                                 delta = chunk_data["choices"][0].get("delta", {})
                                 if "content" in delta:
-                                    await self.emit_message(delta["content"])
+                                    content_chunk = delta["content"]
+                                    await self.emit_message(content_chunk)
+                                    comprehensive_answer += content_chunk
                         except json.JSONDecodeError:
                             logger.error(
                                 f'ChunkDecodeError: unable to parse "{chunk_str[:100]}"'
@@ -1664,6 +1983,10 @@ The user will only see your final synthesis, not the research process, so make i
                 if "choices" in response and len(response["choices"]) > 0:
                     content = response["choices"][0]["message"]["content"]
                     await self.emit_message(content)
+                    comprehensive_answer = content
+
+            # Store the comprehensive answer for potential follow-up queries
+            self.prev_comprehensive_summary = comprehensive_answer
 
         except Exception as e:
             logger.error(f"Error generating synthesis: {e}")
