@@ -12,7 +12,7 @@ Behind the scenes it is semantically compressing the best option from a few web 
 
 Option to use different (larger) model for synthesis after research cycles
 
-- I currently recommend gemma3:12b 4-bit as the research model, and gemma3:27b 4-bit as the synthesis model if you can swing it. If you're running two 3090s like me (and have your output tokens limit set appropriately, at least 4096), you're better off running gemma3:12b at a high context to capture all research from the default 5-10 cycles, than trying to crunch the result size or number of results or compression amount to fit gemma3:27b
+- I currently recommend gemma3:12b 4-bit as the research model, and gemma3:27b 4-bit as the synthesis model if you can swing it. If you're running two 3090s like me or otherwise have 48gb VRAM, you can lower gemma3:12b output tokens to 2048 and fit gemma3:27b with 45k context as the synthesis model. Ideally you would set research model output tokens to 4096 or higher but it's probably worth the crunch for the larger model. Todo add another layer of similarity comparisons and semantic compression to further optimize full research readout before provision to synthesis model
 
 Parses PDFs appropriately as results, up to the first 50 pages by default, same 30k token per-result limit
 
