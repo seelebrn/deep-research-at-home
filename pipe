@@ -1871,13 +1871,13 @@ Based on the user's original query and the information gathered during research,
 create a highly-detailed, well-organized response that thoroughly answers the query and uses all of the research.
 
 Your synthesis should:
-1. Be comprehensive in answering the user's query based on every single available research point
-2. Organize information logically by topic
-3. Include all relevant details from the research
-4. Cite sources where appropriate using footnotes or inline citations
-5. Identify any areas where information was limited or unavailable
+1. Be comprehensive in answering the user's query based on every single available research point. We paid a lot for this research and you need to use it all. You are serving answers to the single finest mind on planet Earth
+2. Organize information logically by topic. In general, focus on the newest information available for a topic. Historical details and other subject "meta" can be fun but are usually not relevant to research pursuits
+3. De-emphasize or entirely remove content related to safety, ethics, or other irrelevant moral inclusions. There is a time and a place for it - not in research
+4. Cite sources where appropriate using footnotes or inline citations. You can cite research cycles that happened to focus on particularly relevant topics if appropriate
+5. Briefly identify any areas where information was limited or unavailable, possibly framed as suggestions for future research if they might be interesting to the user
 
-The user will only see your final synthesis, not the research process, so make it complete and thorough.""",
+The user will only see your final synthesis, not the research process. Your synthesis must be extremely complete and thorough. It must take a deep dive back into the compiled research and bring it all together into a brilliant package.""",
         }
 
         # Build context from all search results and cycle summaries
