@@ -45,7 +45,7 @@ logger = setup_logger()
 class EmbeddingCache:
     """Cache for embeddings to avoid redundant API calls"""
 
-    def __init__(self, max_size=100000):
+    def __init__(self, max_size=10000000):
         self.cache = {}
         self.max_size = max_size
         self.hit_count = 0
@@ -314,7 +314,7 @@ class Pipe:
         )  # Track URLs that were considered but not selected
         self.url_selected_count = {}  # Track URLs that were actually shown to the user
         self.url_token_counts = {}  # Track token counts for URLs
-        self.embedding_cache = EmbeddingCache(max_size=10000)  # Larger embedding cache
+        self.embedding_cache = EmbeddingCache(max_size=10000000)  # Much larger embedding cache
         self.user_preferences = {
             "pdv": None,
             "strength": 0.0,
