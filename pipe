@@ -297,12 +297,6 @@ class Pipe:
             default=True,
             description="Enable verification of citations against sources",
         )
-        MAX_CITATIONS_TO_VERIFY: int = Field(
-            default=30,
-            description="Maximum number of citations to verify",
-            ge=5,
-            le=100,
-        )
         CITATION_VERIFICATION_TIMEOUT: int = Field(
             default=15,
             description="Timeout in seconds for citation verification",
@@ -4817,26 +4811,14 @@ Does the source content support the citation? Respond in JSON format with:
 
         bibliography = bibliography_data["bibliography"]
 
-        # Limit the number of citations to verify
-        citations_to_verify = min(
-            len(bibliography), self.valves.MAX_CITATIONS_TO_VERIFY
-        )
-
-        # Select citations to verify (prioritize ones with URLs)
+        # Verify all citations with URLs
         verify_candidates = [
             c for c in bibliography if not c["url"].startswith("Source ")
         ]
-        if len(verify_candidates) < citations_to_verify:
-            # Add some non-URL sources to reach the desired count
-            non_url_sources = [
-                c for c in bibliography if c["url"].startswith("Source ")
-            ]
-            verify_candidates.extend(
-                non_url_sources[: citations_to_verify - len(verify_candidates)]
-            )
 
-        # Limit to max citations
-        verify_candidates = verify_candidates[:citations_to_verify]
+        # Also include non-URL sources that might need verification
+        non_url_sources = [c for c in bibliography if c["url"].startswith("Source ")]
+        verify_candidates.extend(non_url_sources)
 
         # Get sections with citations
         section_citations = self.section_citations
@@ -4868,21 +4850,30 @@ Does the source content support the citation? Respond in JSON format with:
                                 self.verify_citation(citation, url, citation_id)
                             )
 
-        # Run verification tasks concurrently with limit
-        max_concurrent = 5  # Limit concurrent verifications
+        # Run verification tasks concurrently with appropriate batching
+        # Use a semaphore to limit concurrent requests and avoid overwhelming resources
+        semaphore = asyncio.Semaphore(5)  # Allow up to 5 concurrent verification tasks
+
+        async def verify_with_semaphore(task):
+            async with semaphore:
+                return await task
+
+        # Create tasks with semaphore control
+        tasks = [verify_with_semaphore(task) for task in verification_tasks]
+
+        # Process all tasks with progress updates
         results = []
+        total_tasks = len(tasks)
 
-        for i in range(0, len(verification_tasks), max_concurrent):
-            batch = verification_tasks[i : i + max_concurrent]
-            batch_results = await asyncio.gather(*batch)
-            results.extend(batch_results)
+        for i, task in enumerate(asyncio.as_completed(tasks)):
+            result = await task
+            results.append(result)
 
-            # Emit progress
-            await self.emit_status(
-                "info",
-                f"Verified {len(results)}/{len(verification_tasks)} citations...",
-                False,
-            )
+            # Emit progress update periodically
+            if (i + 1) % 5 == 0 or (i + 1) == total_tasks:
+                await self.emit_status(
+                    "info", f"Verified {i + 1}/{total_tasks} citations...", False
+                )
 
         # Separate verified and flagged citations
         verified_citations = [r for r in results if r.get("verified", False)]
