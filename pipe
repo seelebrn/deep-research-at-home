@@ -240,7 +240,7 @@ class Pipe:
             description="Enable processing of PDF files",
         )
         RELEVANCY_SNIPPET_LENGTH: int = Field(
-            default=2000,
+            default=3000,
             description="Number of characters to use when comparing extra results for relevance",
             ge=100,
             le=5000,
@@ -314,7 +314,9 @@ class Pipe:
         )  # Track URLs that were considered but not selected
         self.url_selected_count = {}  # Track URLs that were actually shown to the user
         self.url_token_counts = {}  # Track token counts for URLs
-        self.embedding_cache = EmbeddingCache(max_size=10000000)  # Much larger embedding cache
+        self.embedding_cache = EmbeddingCache(
+            max_size=10000000
+        )  # MUCH larger embedding cache (human added three zeros)
         self.user_preferences = {
             "pdv": None,
             "strength": 0.0,
@@ -1329,7 +1331,7 @@ class Pipe:
         )
 
         # Get content embedding
-        content_embedding = await self.get_embedding(window_content[:2000])
+        content_embedding = await self.get_embedding(window_content[:1000])
         if not content_embedding:
             return window_content
 
@@ -3280,7 +3282,7 @@ class Pipe:
                 # Calculate average relevance of existing results to this topic
                 relevance_sum = 0
                 for result in research_results[-10:]:  # Consider recent results
-                    result_content = result.get("content", "")[:2000]
+                    result_content = result.get("content", "")[:3000]
                     if result_content:
                         result_embedding = await self.get_embedding(result_content)
                         if result_embedding:
@@ -6139,9 +6141,12 @@ Format your response as a valid JSON object with the following structure:
             search_context = ""
             if results_history:
                 search_context += "### Previously gathered information:\n\n"
-                for i, result in enumerate(
-                    results_history[-5:]
-                ):  # Just include the last 5 results
+
+                # Use twice the number of queries generated per cycle
+                num_queries_per_cycle = len(queries)
+                results_to_show = num_queries_per_cycle * 2
+
+                for i, result in enumerate(results_history[-results_to_show:]):
                     search_context += f"Result {i+1} (Query: '{result['query']}')\n"
                     search_context += f"URL: {result['url']}\n"
                     search_context += f"Summary: {result['content']}...\n\n"
