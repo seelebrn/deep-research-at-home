@@ -7241,13 +7241,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     local_id = source_data.get("id")
                     if local_id is not None:
                         # Find all instances of this citation in the text
-                        pattern = (
-                            r"(?<=[.!?]*(?:\["
-                            + str(local_id)
-                            + r"\]|&#"
-                            + str(local_id)
-                            + r")[^.!?]*[.!?])"
-                        )
+			pattern = r"([^.!?]*(?:\[" + str(local_id) + r"\]|&#" + str(local_id) + r")[^.!?]*[.!?])"
                         context_matches = re.findall(pattern, subtopic_content)
 
                         for match in context_matches:
