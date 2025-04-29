@@ -358,6 +358,12 @@ class Pipe:
             ge=1000,
             le=8000,
         )
+        COMPRESSION_SETPOINT: int = Field(
+            default=4000,
+            description="Length at which semantic compression of results engages",
+            ge=300,
+            le=8000,
+        )
         REPEATS_BEFORE_EXPANSION: int = Field(
             default=3,
             description="Number of times a result must be repeated before adding extra results",
@@ -2208,7 +2214,7 @@ class Pipe:
         total_tokens_after = 0
 
         # Define token limit for results
-        max_tokens = self.valves.MAX_RESULT_TOKENS
+        max_tokens = self.valves.COMPRESSION_SETPOINT
 
         # Process older results with standard compression
         processed_older = []
@@ -2275,7 +2281,7 @@ class Pipe:
                 processed_older.append(result)
                 total_tokens_after += original_tokens
 
-        # Process newer results with less compression
+        # Process newer results with more compression
         processed_newer = []
         for result in newer_results:
             content = result.get("content", "")
@@ -7004,7 +7010,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         Your subsection MUST:
         1. Focus specifically on the subtopic "{subtopic}" within the broader section "{section_title}".
         2. Make FULL use of the provided research sources, and ONLY the provided sources.
-        3. Include IN-TEXT CITATIONS for all information from sources, using ONLY the numerical format [#] provided in the source list.
+        3. Include IN-TEXT CITATIONS for all information from sources, using ONLY the numerical IDs provided in the source list, e.g. [1], [4], etc.
         4. Follow a structure that best fits the subtopic subject matter. Aim for an academic report style while tolerating flexibility as appropriate.
         5. Only be written on the subtopic matter - consider how your subsection will be combined with others in a greater research report.
         6. Be written to a length, between 1 medium paragraph and 3 long paragraphs, based on the subtopic's perceived importance to the research query.
@@ -7017,7 +7023,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
         6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
 
-        You must accurately cite your sources to avoid plagiarizing. Citations MUST be numerical [#] and correspond to the correct source ID in the provided list.
+        You must accurately cite your sources to avoid plagiarizing. Citations MUST be numerical and correspond to the correct source ID in the provided list.
         Do not combine multiple IDs in one citation tag. Please respond with just the subsection body, no intro or title.""",
         }
 
@@ -7235,7 +7241,13 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     local_id = source_data.get("id")
                     if local_id is not None:
                         # Find all instances of this citation in the text
-                        pattern = r"([^.!?]*\[" + str(local_id) + r"\][^.!?]*[.!?])"
+                        pattern = (
+                            r"(?<=[.!?]*(?:\["
+                            + str(local_id)
+                            + r"\]|&#"
+                            + str(local_id)
+                            + r")[^.!?]*[.!?])"
+                        )
                         context_matches = re.findall(pattern, subtopic_content)
 
                         for match in context_matches:
