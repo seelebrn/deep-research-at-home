@@ -600,6 +600,9 @@ class Pipe:
         if not text or not text.strip():
             return None
 
+        text = text[:2000]
+        text = text.replace(":", " - ")
+
         # Check cache first
         cached_embedding = self.embedding_cache.get(text)
         if cached_embedding is not None:
@@ -2583,24 +2586,6 @@ class Pipe:
         # Store updated counts
         self.update_state("topic_usage_counts", topic_usage_counts)
 
-    async def update_research_dimensions_display(self):
-        """Ensure research dimensions are properly updated for display"""
-        state = self.get_state()
-        research_dimensions = state.get("research_dimensions")
-
-        if research_dimensions:
-            # Make sure we save a copy of the current coverage
-            coverage = research_dimensions.get("coverage", [])
-            if coverage:
-                self.update_state("latest_dimension_coverage", coverage.copy())
-                logger.info(
-                    f"Updated latest dimension coverage with {len(coverage)} values"
-                )
-            else:
-                logger.warning("Research dimensions exist but coverage is empty")
-        else:
-            logger.warning("No research dimensions available for display")
-
     async def calculate_query_similarity(
         self,
         content_embedding: List[float],
@@ -2938,8 +2923,8 @@ class Pipe:
                 ]
                 top_words_str = ", ".join([word for word, _ in top_words])
 
-                # Create label with coverage percentage
-                cov_percentage = int(coverage[i] * 100)
+                # Create label
+                cov_percentage = coverage[i]
                 dimension_labels.append(
                     {
                         "dimension": i + 1,
@@ -2983,10 +2968,10 @@ class Pipe:
         research_dimensions = state.get("research_dimensions")
 
         if research_dimensions:
-            # Make sure we save a copy of the current coverage
+            # Don't make a separate copy - just point to the actual dimension coverage
             coverage = research_dimensions.get("coverage", [])
             if coverage:
-                self.update_state("latest_dimension_coverage", coverage.copy())
+                self.update_state("latest_dimension_coverage", coverage)
                 logger.info(
                     f"Updated latest dimension coverage with {len(coverage)} values"
                 )
@@ -2999,24 +2984,19 @@ class Pipe:
         self, outline_items: List[str], user_query: str
     ):
         """Initialize the semantic dimensions for tracking research progress"""
-        # Combine outline items and query
-        all_text = " ".join(outline_items) + " " + user_query
-
-        # Get embedding for combined text
-        combined_embedding = await self.get_embedding(all_text)
-        if not combined_embedding:
-            self.update_state("research_dimensions", None)
-            return
-
         try:
             # Get embeddings for each outline item sequentially
             item_embeddings = []
             for item in outline_items:
-                embedding = await self.get_embedding(item)
+                embedding = await self.get_embedding(item[:2000])
                 if embedding:
                     item_embeddings.append(embedding)
 
+            # Ensure we have enough embeddings for PCA
             if len(item_embeddings) < 3:
+                logger.warning(
+                    f"Not enough valid embeddings for research dimensions: {len(item_embeddings)}/3 required"
+                )
                 self.update_state("research_dimensions", None)
                 return
 
@@ -3029,16 +3009,21 @@ class Pipe:
             research_dimensions = {
                 "eigenvectors": pca.components_.tolist(),
                 "eigenvalues": pca.explained_variance_.tolist(),
+                "explained_variance": pca.explained_variance_ratio_.tolist(),
                 "total_variance": pca.explained_variance_ratio_.sum(),
                 "dimensions": pca.n_components_,
-                "coverage": np.zeros(pca.n_components_).tolist(),
+                "coverage": np.zeros(
+                    pca.n_components_
+                ).tolist(),  # Initialize empty coverage
             }
+
             self.update_state("research_dimensions", research_dimensions)
 
             # Immediately store a copy of coverage for display
             self.update_state(
                 "latest_dimension_coverage", research_dimensions["coverage"]
             )
+
             logger.info(
                 f"Initialized research dimensions with {pca.n_components_} dimensions"
             )
@@ -3049,68 +3034,51 @@ class Pipe:
     async def update_dimension_coverage(
         self, content: str, quality_factor: float = 1.0
     ):
-        """Update the coverage of research dimensions based on new content with projection caching"""
+        """Update the coverage of research dimensions based on new content"""
+        # Get current state
         state = self.get_state()
         research_dimensions = state.get("research_dimensions")
         if not research_dimensions:
             return
 
         try:
-            # Check content embedding cache first
-            content_key = f"content_embedding_{hash(content[:2000])}"
-            content_embedding = state.get(content_key)
-
-            if not content_embedding:
-                # If not in cache, get embedding for the content
-                content_embedding = await self.get_embedding(content[:2000])
-                if content_embedding:
-                    # Cache the content embedding
-                    self.update_state(content_key, content_embedding)
-
+            # Get embedding for the content
+            content_embedding = await self.get_embedding(content[:2000])
             if not content_embedding:
                 return
 
-            # Check projection cache
-            projection_cache = state.get("projection_cache", {})
-            # Create a stable cache key from the embedding
-            embedding_key = hash(str(np.array(content_embedding).round(2)))
+            # Get current coverage
+            current_coverage = research_dimensions.get("coverage", [])
+            eigenvectors = research_dimensions.get("eigenvectors", [])
 
-            if embedding_key in projection_cache:
-                projection = projection_cache[embedding_key]
-            else:
-                # Project onto principal components
-                eigenvectors = np.array(research_dimensions["eigenvectors"])
+            if not current_coverage or not eigenvectors:
+                return
 
-                # Center the embedding (using approximate mean from the PCA)
-                # This is needed because PCA assumes centered data
-                centered_embedding = np.array(content_embedding)
+            # Convert to numpy for calculations
+            coverage_array = np.array(current_coverage)
+            eigenvectors_array = np.array(eigenvectors)
 
-                # Project onto eigenvectors
-                projection = np.dot(centered_embedding, eigenvectors.T)
-
-                # Cache the projection
-                projection_cache[embedding_key] = projection
-
-            # Update coverage based on projection
+            # Calculate projection and contribution
+            projection = np.dot(np.array(content_embedding), eigenvectors_array.T)
             contribution = np.abs(projection) * quality_factor
 
-            # Get current coverage
-            coverage = np.array(research_dimensions["coverage"])
+            # Update coverage directly
+            for i in range(min(len(contribution), len(coverage_array))):
+                current_value = coverage_array[i]
+                new_contribution = contribution[i] * (1 - current_value / 2)
+                coverage_array[i] += new_contribution
 
-            # Update coverage with diminishing returns for already-covered dimensions
-            for i in range(len(contribution)):
-                current_coverage = coverage[i]
-                # Apply diminishing returns formula
-                new_contribution = contribution[i] * (1 - current_coverage / 2)
-                coverage[i] += new_contribution
+            # Update the coverage in research_dimensions
+            research_dimensions["coverage"] = coverage_array.tolist()
 
-            # Normalize coverage to 0-1 range
-            max_possible = 3.0  # Maximum reasonable coverage value
-            coverage = np.minimum(coverage, max_possible) / max_possible
-
-            # Update the state with the new coverage
-            research_dimensions["coverage"] = coverage.tolist()
+            # Update both state keys
             self.update_state("research_dimensions", research_dimensions)
+            self.update_state("latest_dimension_coverage", coverage_array.tolist())
+
+            logger.debug(
+                f"Updated dimension coverage: {[round(c * 100) for c in coverage_array.tolist()]}%"
+            )
+
         except Exception as e:
             logger.error(f"Error updating dimension coverage: {e}")
 
@@ -4783,15 +4751,53 @@ class Pipe:
         logger.info(
             f"Selected {len(selected_results)} most relevant results from {len(results)} total (added {additional_results} due to repeats)"
         )
-        # If dimension tracking is enabled, log this search's dimension coverage
-        research_dimensions = state.get("research_dimensions")
-        if research_dimensions and selected_results:
-            for result in selected_results:
-                content = result.get("content", "")
-                if content:
-                    # Use similarity as quality score
-                    quality = result.get("similarity", 0.5)
-                    await self.update_dimension_coverage(content, quality)
+        # Collect all content and quality factors first
+        all_content = []
+        for result in selected_results:
+            content = result.get("content", "")[:2000]
+            if content:
+                # Use similarity as quality factor, normalize between 0.5-1.0
+                quality = 0.5
+                if "similarity" in result:
+                    quality = 0.5 + (result["similarity"] * 0.5)
+                all_content.append((content, quality))
+
+        # Update ALL coverage in a single call
+        if all_content:
+            # Just grab dimensions once
+            state = self.get_state()
+            dims = state.get("research_dimensions")
+            if dims and "coverage" in dims:
+                coverage = np.array(dims["coverage"])
+
+                # Process each content item sequentially
+                for content, quality in all_content:
+                    embed = await self.get_embedding(content[:2000])
+                    if not embed:
+                        continue
+                    projection = np.dot(embed, np.array(dims["eigenvectors"]).T)
+                    contribution = np.abs(projection) * quality
+
+                    # Update coverage directly
+                    for i in range(min(len(contribution), len(coverage))):
+                        coverage[i] += contribution[i] * (1 - coverage[i] / 2)
+
+                # Normalize once at the end
+                coverage = np.minimum(coverage, 3.0) / 3.0
+
+                # Save back
+                dims["coverage"] = coverage.tolist()
+                self.update_state("research_dimensions", dims)
+                self.update_state("latest_dimension_coverage", coverage.tolist())
+
+                # Log dimension updates for debugging
+                state = self.get_state()
+                research_dimensions = state.get("research_dimensions")
+                if research_dimensions:
+                    coverage = research_dimensions.get("coverage", [])
+                    logger.debug(
+                        f"Dimension coverage after result: {[round(c * 100) for c in coverage[:3]]}%..."
+                    )
 
         return selected_results
 
@@ -5085,7 +5091,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     # Add repeat indicator if this is a repeated URL
                     repeat_count = processed_result.get("repeat_count", 0)
                     if repeat_count > 1:
-                        result_text += f"*Note: This URL has been processed {repeat_count + 1} times*\n\n"
+                        result_text += f"*Note: This URL has been processed {repeat_count} times*\n\n"
 
                     await self.emit_message(result_text)
 
@@ -5906,6 +5912,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Calculate preference direction vector based on kept and removed items
         preference_vector = await self.calculate_preference_direction_vector(
             kept_items, removed_items, flat_items
+        )
+
+        # Update user_preferences in state with the new preference vector
+        self.update_state("user_preferences", preference_vector)
+        logger.info(
+            f"Updated user_preferences with PDV impact: {preference_vector.get('impact', 0.0):.3f}"
         )
 
         # Show the user what's happening
@@ -7241,7 +7253,13 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     local_id = source_data.get("id")
                     if local_id is not None:
                         # Find all instances of this citation in the text
-			pattern = r"([^.!?]*(?:\[" + str(local_id) + r"\]|&#" + str(local_id) + r")[^.!?]*[.!?])"
+                        pattern = (
+                            r"([^.!?]*(?:\["
+                            + str(local_id)
+                            + r"\]|&#"
+                            + str(local_id)
+                            + r")[^.!?]*[.!?])"
+                        )
                         context_matches = re.findall(pattern, subtopic_content)
 
                         for match in context_matches:
@@ -7699,30 +7717,47 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             return combined_content
 
     async def generate_bibliography(self, master_source_table, global_citation_map):
-        """Generate a bibliography using sequential numbering with no gaps based on correlated source URLs"""
-        if not master_source_table or not global_citation_map:
+        """Generate a bibliography using sequential numbering based on actual citations in the report"""
+        if not master_source_table:
             return {
                 "bibliography": [],
                 "title_to_global_id": {},
                 "url_to_global_id": {},
             }
 
-        # Sort URLs by their assigned citation ID in the global_citation_map
-        sorted_urls = sorted(global_citation_map.items(), key=lambda x: x[1])
+        # First, scan all compiled sections to find actually cited sources
+        state = self.get_state()
+        compiled_sections = state.get("section_synthesized_content", {})
 
-        # Create bibliography entries based on global citation ordering
+        # Extract all citation numbers from the compiled text
+        cited_numbers = set()
+        for section_content in compiled_sections.values():
+            # Find all citations in format [n] where n is a number
+            citation_matches = re.findall(r"\[(\d+)\]", section_content)
+            for num in citation_matches:
+                cited_numbers.add(int(num))
+
+        # Filter global_citation_map to only include cited sources
+        cited_urls = {}
+        for url, id_num in global_citation_map.items():
+            if id_num in cited_numbers:
+                cited_urls[url] = id_num
+
+        # Sort URLs by their assigned citation ID
+        sorted_urls = sorted(cited_urls.items(), key=lambda x: x[1])
+
+        # Create bibliography entries based on cited sources only
         bibliography = []
         url_to_global_id = {}
         title_to_global_id = {}
 
         # Use the sequential numbers already assigned in global_citation_map
         for url, global_id in sorted_urls:
-            # Get source data from master_source_table if available, otherwise create basic entry
+            # Get source data from master_source_table if available
             if url in master_source_table:
                 source_data = master_source_table[url]
                 title = source_data.get("title", "Untitled Source")
             else:
-                # This should be rare if correlation worked properly
                 logger.warning(
                     f"URL {url} in global_citation_map not found in master_source_table"
                 )
@@ -7741,11 +7776,11 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             url_to_global_id[url] = global_id
             title_to_global_id[title] = global_id
 
-        # Sort bibliography by citation ID to ensure proper ordering
+        # Sort bibliography by citation ID
         bibliography.sort(key=lambda x: x["id"])
 
         logger.info(
-            f"Generated bibliography with {len(bibliography)} entries from correlated sources"
+            f"Generated bibliography with {len(bibliography)} cited entries (from {len(global_citation_map)} total sources)"
         )
         return {
             "bibliography": bibliography,
@@ -8446,10 +8481,25 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             if query_embedding and len(kept_embeddings) >= 3:
                 # Create a simple eigendecomposition
                 try:
-                    kept_array = np.array(kept_embeddings)
-                    # Simple PCA
-                    pca = PCA(n_components=min(3, len(kept_embeddings)))
-                    pca.fit(kept_array)
+                    # Filter out any non-array elements that could cause errors
+                    valid_embeddings = []
+                    for emb in kept_embeddings:
+                        if isinstance(emb, list) or (
+                            hasattr(emb, "ndim") and emb.ndim == 1
+                        ):
+                            valid_embeddings.append(emb)
+
+                    # Only proceed if we have enough valid embeddings
+                    if len(valid_embeddings) >= 3:
+                        kept_array = np.array(valid_embeddings)
+                        # Simple PCA
+                        pca = PCA(n_components=min(3, len(valid_embeddings)))
+                        pca.fit(kept_array)
+                    else:
+                        logger.warning(
+                            f"Not enough valid embeddings for PCA: {len(valid_embeddings)}/3 required"
+                        )
+                        return []
 
                     eigen_data = {
                         "eigenvectors": pca.components_.tolist(),
@@ -10031,7 +10081,7 @@ Format your response as a valid JSON object with the following structure:
         await self.emit_status(
             "info", "Displaying research dimensions coverage...", False
         )
-        await self.emit_message("### Research Dimensions Coverage\n\n")
+        await self.emit_message("### Research Dimensions (Ordered)\n\n")
 
         research_dimensions = state.get("research_dimensions")
         latest_coverage = state.get("latest_dimension_coverage")
@@ -10043,12 +10093,14 @@ Format your response as a valid JSON object with the following structure:
                     research_dimensions, latest_coverage
                 )
 
-                # Display dimensions with their coverage
-                for i, dim in enumerate(dimension_labels[:10]):  # Limit to top 10
-                    coverage_pct = dim.get("coverage", 0)
-                    await self.emit_message(
-                        f"- **{dim.get('words', f'Dimension {i+1}')}**: {coverage_pct}% covered\n"
-                    )
+                # Sort dimensions by coverage (highest to lowest)
+                sorted_dimensions = sorted(
+                    dimension_labels, key=lambda x: x.get("coverage", 0), reverse=True
+                )
+
+                # Display dimensions without coverage percentages
+                for dim in sorted_dimensions[:10]:  # Limit to top 10
+                    await self.emit_message(f"- {dim.get('words', 'Dimension')}\n")
 
                 await self.emit_message("\n")
             except Exception as e:
