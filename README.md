@@ -6,7 +6,7 @@ After the user enters a query, the script generates a handful of starter searche
 
 The default settings are geared towards my personal dual-3090 setup. You could probably get this to be reasonably performant with 8-12gb VRAM by dropping MAX_CYCLES, MAX_RESULT_TOKENS, COMPRESSION_SETPOINT, using gemma3:12b for synthesis, possibly adjusting the equation governing amount of most relevant sources provided to each subsection model instance... on a tangential note, the final outline (by which the report is generated) scales based on the number of occurred research cycles and is set towards the smaller side to further reduce the slop factor of the final product (see prompt in generate_synthesis_outline) - adjust those equations to taste if you want a longer/even shorter final report, and even consider setting it for a super long output just to use the research deliverable as an intermediate you can then parse/process/summarize separately. 
 
-You'll need to provide your own search engine information - I use my own SearXNG instance and recommend the same. Be aware: the useragent/headers/referer/request delay efforts only go so far, and certain high-tier academic sources *will* begin filtering your traffic, so limit your most-important researches accordingly.
+You'll need to provide your own search engine information - I use my own SearXNG instance and recommend the same. Be aware: the useragent/headers/referer/request delay efforts only go so far, and certain high-tier academic sources *will* begin filtering your traffic, so limit your most-important researches accordingly. EDIT: I added archive.org integration as a fallback which helps significantly
 
 Below is an example query and output, which took 39 minutes for ten research cycles and full generation:
 
