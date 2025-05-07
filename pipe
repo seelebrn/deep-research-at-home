@@ -322,6 +322,33 @@ class Pipe:
             ge=100,
             le=5000,
         )
+        DOMAIN_PRIORITY: str = Field(
+            default="",
+            description="Comma or space-separated list of domain keywords to prioritize (e.g., '.gov, .edu, epa'). Leave empty to disable domain prioritization.",
+        )
+
+        CONTENT_PRIORITY: str = Field(
+            default="",
+            description="Comma or space-separated list of content keywords to prioritize (e.g., 'pfas, spatial, groundwater'). Leave empty to disable content prioritization.",
+        )
+        DOMAIN_MULTIPLIER: float = Field(
+            default=1.3,
+            description="Multiplier for results from priority domains (1.0 = no change, 2.0 = double score)",
+            ge=1.0,
+            le=3.0,
+        )
+        KEYWORD_MULTIPLIER_PER_MATCH: float = Field(
+            default=1.1,
+            description="Multiplier applied per matched content keyword (1.1 = 10% increase per keyword)",
+            ge=1.0,
+            le=1.5,
+        )
+        MAX_KEYWORD_MULTIPLIER: float = Field(
+            default=2.0,
+            description="Maximum total multiplier from content keywords",
+            ge=1.0,
+            le=3.0,
+        )
         INTERACTIVE_RESEARCH: bool = Field(
             default=True,
             description="Enable user interaction during research",
@@ -3598,6 +3625,24 @@ class Pipe:
                                 )
 
                             return extracted_content
+                        elif response.status == 403 or response.status == 271:
+                            # Try archive.org for 403 errors
+                            logger.info(
+                                f"Received 403 for PDF {url}, trying archive.org"
+                            )
+                            archive_content = await self.fetch_from_archive(
+                                url, session
+                            )
+                            if archive_content:
+                                return archive_content
+
+                            # If archive fallback fails, return original error
+                            logger.error(
+                                f"Error fetching URL {url}: HTTP {response.status} (archive fallback failed)"
+                            )
+                            return (
+                                f"Error fetching content: HTTP status {response.status}"
+                            )
                         else:
                             logger.error(
                                 f"Error fetching URL {url}: HTTP {response.status}"
@@ -3793,6 +3838,24 @@ class Pipe:
                                 )
 
                             return content
+                        elif response.status == 403 or response.status == 271:
+                            # Try archive.org for 403 errors
+                            logger.info(
+                                f"Received 403 for URL {url}, trying archive.org"
+                            )
+                            archive_content = await self.fetch_from_archive(
+                                url, session
+                            )
+                            if archive_content:
+                                return archive_content
+
+                            # If archive fallback fails, return original error
+                            logger.error(
+                                f"Error fetching URL {url}: HTTP {response.status} (archive fallback failed)"
+                            )
+                            return (
+                                f"Error fetching content: HTTP status {response.status}"
+                            )
                         else:
                             logger.error(
                                 f"Error fetching URL {url}: HTTP {response.status}"
@@ -3813,6 +3876,172 @@ class Pipe:
         except Exception as e:
             logger.error(f"Error fetching content from {url}: {e}")
             return f"Error fetching content: {str(e)}"
+
+    async def fetch_from_archive(self, url: str, session=None) -> str:
+        """Fetch content from the Internet Archive (archive.org)"""
+        try:
+            # Construct Wayback Machine URL
+            wayback_api_url = f"https://archive.org/wayback/available?url={url}"
+
+            # Create a new session if not provided
+            close_session = False
+            if session is None:
+                close_session = True
+                connector = aiohttp.TCPConnector(verify_ssl=False, force_close=True)
+                session = aiohttp.ClientSession(connector=connector)
+
+            try:
+                # First check if the URL is archived
+                async with session.get(wayback_api_url, timeout=15.0) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        # Check if there are archived snapshots
+                        snapshots = data.get("archived_snapshots", {})
+                        closest = snapshots.get("closest", {})
+                        archived_url = closest.get("url")
+
+                        if archived_url:
+                            logger.info(f"Found archive for {url}: {archived_url}")
+                            # Fetch the content from the archived URL
+                            async with session.get(
+                                archived_url, timeout=20.0
+                            ) as archive_response:
+                                if archive_response.status == 200:
+                                    content_type = archive_response.headers.get(
+                                        "Content-Type", ""
+                                    ).lower()
+
+                                    if "application/pdf" in content_type:
+                                        # Handle PDF from archive
+                                        pdf_content = await archive_response.read()
+                                        self.is_pdf_content = True
+                                        extracted_content = (
+                                            await self.extract_text_from_pdf(
+                                                pdf_content
+                                            )
+                                        )
+
+                                        # Cache the archived content
+                                        state = self.get_state()
+                                        url_results_cache = state.get(
+                                            "url_results_cache", {}
+                                        )
+                                        url_results_cache[url] = extracted_content
+                                        self.update_state(
+                                            "url_results_cache", url_results_cache
+                                        )
+
+                                        # Update master source table
+                                        master_source_table = state.get(
+                                            "master_source_table", {}
+                                        )
+                                        if url not in master_source_table:
+                                            title = f"Archived PDF: {url.split('/')[-1].replace('.pdf','').replace('-',' ').replace('_',' ')}"
+                                            source_id = (
+                                                f"S{len(master_source_table) + 1}"
+                                            )
+                                            master_source_table[url] = {
+                                                "id": source_id,
+                                                "title": title,
+                                                "content_preview": extracted_content[
+                                                    :500
+                                                ],
+                                                "source_type": "pdf",
+                                                "accessed_date": self.research_date,
+                                                "cited_in_sections": set(),
+                                                "archived": True,
+                                            }
+                                            self.update_state(
+                                                "master_source_table",
+                                                master_source_table,
+                                            )
+
+                                        return extracted_content
+                                    else:
+                                        # Handle HTML/text from archive
+                                        content = await archive_response.text()
+                                        self.is_pdf_content = False
+
+                                        # Extract and clean text if needed
+                                        if (
+                                            self.valves.EXTRACT_CONTENT_ONLY
+                                            and content.strip().startswith("<")
+                                        ):
+                                            extracted = (
+                                                await self.extract_text_from_html(
+                                                    content
+                                                )
+                                            )
+
+                                            # Cache the extracted content
+                                            state = self.get_state()
+                                            url_results_cache = state.get(
+                                                "url_results_cache", {}
+                                            )
+                                            url_results_cache[url] = extracted
+                                            self.update_state(
+                                                "url_results_cache", url_results_cache
+                                            )
+
+                                            # Update master source table
+                                            master_source_table = state.get(
+                                                "master_source_table", {}
+                                            )
+                                            if url not in master_source_table:
+                                                title = f"Archived: {url}"
+                                                title_match = re.search(
+                                                    r"<title>(.*?)</title>",
+                                                    content,
+                                                    re.IGNORECASE | re.DOTALL,
+                                                )
+                                                if title_match:
+                                                    title = f"Archived: {title_match.group(1).strip()}"
+
+                                                source_id = (
+                                                    f"S{len(master_source_table) + 1}"
+                                                )
+                                                master_source_table[url] = {
+                                                    "id": source_id,
+                                                    "title": title,
+                                                    "content_preview": extracted[:500],
+                                                    "source_type": "web",
+                                                    "accessed_date": self.research_date,
+                                                    "cited_in_sections": set(),
+                                                    "archived": True,
+                                                }
+                                                self.update_state(
+                                                    "master_source_table",
+                                                    master_source_table,
+                                                )
+
+                                            return extracted
+                                        else:
+                                            # Cache the raw content
+                                            state = self.get_state()
+                                            url_results_cache = state.get(
+                                                "url_results_cache", {}
+                                            )
+                                            url_results_cache[url] = content
+                                            self.update_state(
+                                                "url_results_cache", url_results_cache
+                                            )
+                                            return content
+                        else:
+                            logger.warning(f"No archived version found for {url}")
+                            return ""
+                    else:
+                        logger.warning(
+                            f"Error accessing archive.org API: {response.status}"
+                        )
+                        return ""
+            finally:
+                # Close the session if we created it
+                if close_session and session:
+                    await session.close()
+
+        except Exception as e:
+            logger.error(f"Error fetching from archive.org: {e}")
+            return ""
 
     async def extract_text_from_pdf(self, pdf_content) -> str:
         """Extract text from PDF content using PyPDF2 or pdfplumber"""
@@ -4608,7 +4837,7 @@ class Pipe:
             return results
 
         # If we only have the base needed amount or fewer, return them all
-        base_results_per_query = 3  # Consolidating the previous valves
+        base_results_per_query = self.valves.SEARCH_RESULTS_PER_QUERY
         if len(results) <= base_results_per_query:
             return results
 
@@ -4635,6 +4864,51 @@ class Pipe:
 
         # Get similarity cache
         similarity_cache = state.get("similarity_cache", {})
+
+        # Process domain priority valve value (if provided)
+        priority_domains = []
+        if hasattr(self.valves, "DOMAIN_PRIORITY") and self.valves.DOMAIN_PRIORITY:
+            # Split by commas and/or spaces
+            domain_input = self.valves.DOMAIN_PRIORITY
+            # Replace commas with spaces, then split by spaces
+            domain_items = domain_input.replace(",", " ").split()
+            # Remove empty items and add to priority domains
+            priority_domains = [
+                item.strip().lower() for item in domain_items if item.strip()
+            ]
+            if priority_domains:
+                logger.info(f"Using priority domains: {priority_domains}")
+
+        # Process content priority valve value (if provided)
+        priority_keywords = []
+        if hasattr(self.valves, "CONTENT_PRIORITY") and self.valves.CONTENT_PRIORITY:
+            # Split by commas and/or spaces, handling quoted phrases
+            content_input = self.valves.CONTENT_PRIORITY
+
+            # Function to parse keywords, respecting quotes
+            def parse_keywords(text):
+                keywords = []
+                # Pattern for quoted phrases or words
+                pattern = r"\'([^\']+)\'|\"([^\"]+)\"|(\S+)"
+
+                matches = re.findall(pattern, text)
+                for match in matches:
+                    # Each match is a tuple with three groups (one will contain the text)
+                    keyword = match[0] or match[1] or match[2]
+                    if keyword:
+                        keywords.append(keyword.lower())
+                return keywords
+
+            priority_keywords = parse_keywords(content_input)
+            if priority_keywords:
+                logger.info(f"Using priority keywords: {priority_keywords}")
+
+        # Get multiplier values from valves or use defaults
+        domain_multiplier = getattr(self.valves, "DOMAIN_MULTIPLIER", 1.5)
+        keyword_multiplier_per_match = getattr(
+            self.valves, "KEYWORD_MULTIPLIER_PER_MATCH", 1.1
+        )
+        max_keyword_multiplier = getattr(self.valves, "MAX_KEYWORD_MULTIPLIER", 2.0)
 
         for i, result in enumerate(results):
             try:
@@ -4700,6 +4974,51 @@ class Pipe:
                             similarity = cosine_similarity(
                                 [snippet_embedding], [query_embedding]
                             )[0][0]
+
+                        # Track original similarity for logging
+                        original_similarity = similarity
+
+                        # Apply domain multiplier if priority domains are set
+                        if priority_domains and url:
+                            url_lower = url.lower()
+                            if any(domain in url_lower for domain in priority_domains):
+                                similarity *= domain_multiplier
+                                logger.debug(
+                                    f"Applied domain multiplier {domain_multiplier}x to URL: {url}"
+                                )
+
+                        # Apply keyword multiplier if priority keywords are set
+                        if priority_keywords and snippet:
+                            snippet_lower = snippet.lower()
+                            # Count matching keywords
+                            keyword_matches = [
+                                keyword
+                                for keyword in priority_keywords
+                                if keyword in snippet_lower
+                            ]
+                            keyword_count = len(keyword_matches)
+
+                            if keyword_count > 0:
+                                # Calculate cumulative multiplier (multiply by keyword_multiplier_per_match for each match)
+                                # But cap at max_keyword_multiplier
+                                cumulative_multiplier = min(
+                                    max_keyword_multiplier,
+                                    keyword_multiplier_per_match**keyword_count,
+                                )
+                                similarity *= cumulative_multiplier
+                                logger.debug(
+                                    f"Applied keyword multiplier {cumulative_multiplier:.2f}x "
+                                    f"({keyword_count} keywords matched: {', '.join(keyword_matches[:3])}) to result {i}"
+                                )
+
+                        # Cap at 0.99 to avoid perfect scores
+                        similarity = min(0.99, similarity)
+
+                        # Log the full transformation if multipliers were applied
+                        if similarity != original_similarity:
+                            logger.info(
+                                f"Result {i} multiplied: {original_similarity:.3f} → {similarity:.3f}"
+                            )
 
                         # Store similarity in the result object for later use in topic dampening
                         result["similarity"] = similarity
@@ -7013,6 +7332,13 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Get relevance cache or initialize it
         relevance_cache = state.get("subtopic_relevance_cache", {})
 
+        # Create embedding cache keys for efficiency
+        query_embedding_key = f"query_embedding_{hash(original_query)}"
+        subtopic_embedding_key = f"subtopic_embedding_{hash(subtopic)}"
+        combined_embedding_key = (
+            f"combined_embedding_{hash(original_query)}_{hash(subtopic)}"
+        )
+
         # Create a prompt specific to this subtopic
         subtopic_prompt = {
             "role": "system",
@@ -7034,33 +7360,68 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         4. Ever take a preachy or moralizing tone, or take a "stance" for or against/"side" with or against anything not driven by the provided data.
         5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
         6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
-
+    
         You must accurately cite your sources to avoid plagiarizing. Citations MUST be numerical and correspond to the correct source ID in the provided list.
         Do not combine multiple IDs in one citation tag. Please respond with just the subsection body, no intro or title.""",
         }
 
-        # Create a combined embedding for query + subtopic
-        combined_embedding = None
-        try:
-            query_embedding = await self.get_embedding(original_query)
-            subtopic_embedding = await self.get_embedding(subtopic)
+        # Create a combined embedding for query + subtopic with state-level caching
+        combined_embedding = state.get(combined_embedding_key)
 
+        if combined_embedding is None:
+            # Check if we already have the individual embeddings cached in state
+            query_embedding = state.get(query_embedding_key)
+            subtopic_embedding = state.get(subtopic_embedding_key)
+
+            # Get query embedding if not already cached
+            if query_embedding is None:
+                try:
+                    query_embedding = await self.get_embedding(original_query)
+                    if query_embedding:
+                        # Cache at state level to avoid repeated API calls
+                        self.update_state(query_embedding_key, query_embedding)
+                except Exception as e:
+                    logger.error(f"Error getting query embedding: {e}")
+
+            # Get subtopic embedding if not already cached
+            if subtopic_embedding is None:
+                try:
+                    subtopic_embedding = await self.get_embedding(subtopic)
+                    if subtopic_embedding:
+                        # Cache at state level to avoid repeated API calls
+                        self.update_state(subtopic_embedding_key, subtopic_embedding)
+                except Exception as e:
+                    logger.error(f"Error getting subtopic embedding: {e}")
+
+            # Create combined embedding if both components exist
             if query_embedding and subtopic_embedding:
-                # Combine with equal weight
-                combined_embedding = (
-                    np.array(query_embedding) * 0.5 + np.array(subtopic_embedding) * 0.5
-                )
-                # Normalize
-                norm = np.linalg.norm(combined_embedding)
-                if norm > 1e-10:
-                    combined_embedding = combined_embedding / norm
-                combined_embedding = combined_embedding.tolist()
-        except Exception as e:
-            logger.error(f"Error creating combined embedding: {e}")
+                try:
+                    # Combine with equal weight
+                    combined_array = (
+                        np.array(query_embedding) * 0.5
+                        + np.array(subtopic_embedding) * 0.5
+                    )
+                    # Normalize
+                    norm = np.linalg.norm(combined_array)
+                    if norm > 1e-10:
+                        combined_array = combined_array / norm
+                    combined_embedding = combined_array.tolist()
+                    # Cache the combined embedding
+                    self.update_state(combined_embedding_key, combined_embedding)
+                except Exception as e:
+                    logger.error(f"Error creating combined embedding: {e}")
 
-        # If combined embedding failed, fall back to just subtopic embedding
+        # If combined embedding failed or doesn't exist, fall back to subtopic embedding
         if not combined_embedding:
-            subtopic_embedding = await self.get_embedding(subtopic)
+            # Check if we have cached subtopic embedding
+            subtopic_embedding = state.get(subtopic_embedding_key)
+            if not subtopic_embedding:
+                # Try to get it now
+                subtopic_embedding = await self.get_embedding(subtopic)
+                # Cache if successful
+                if subtopic_embedding:
+                    self.update_state(subtopic_embedding_key, subtopic_embedding)
+
             combined_embedding = subtopic_embedding
 
         # Build context from research results that might be relevant to this subtopic
@@ -7969,6 +8330,61 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     # Update marker to use global ID for verification tracking
                     citation["global_id"] = global_id
 
+        # Process numeric citations directly from section content
+        state = self.get_state()
+        compiled_sections = state.get("section_synthesized_content", {})
+        numeric_citations_by_url = {}
+
+        # Extract all numeric citations directly from content
+        for section, section_content in compiled_sections.items():
+            numeric_matches = re.findall(r"\[(\d+)\]", section_content)
+            for num in set(numeric_matches):
+                try:
+                    numeric_id = int(num)
+                    # Find URL for this citation number in master_source_table
+                    for url, source_data in master_source_table.items():
+                        source_id = source_data.get("id", "")
+                        # Check if this source ID matches the numeric citation
+                        if source_id == f"S{numeric_id}" or source_id == str(
+                            numeric_id
+                        ):
+                            # Add to global citation map if not already there
+                            if url not in global_citation_map:
+                                global_citation_map[url] = len(global_citation_map) + 1
+
+                            # Create tracking for this citation
+                            if url not in numeric_citations_by_url:
+                                numeric_citations_by_url[url] = []
+
+                            # Find citation context for context checking
+                            pattern = (
+                                r"([^.!?]*\["
+                                + re.escape(str(numeric_id))
+                                + r"\][^.!?]*[.!?])"
+                            )
+                            context_matches = re.findall(pattern, section_content)
+                            for context in context_matches:
+                                numeric_citations_by_url[url].append(
+                                    {
+                                        "marker": str(numeric_id),
+                                        "raw_text": f"[{numeric_id}]",
+                                        "text": context,
+                                        "url": url,
+                                        "section": section,
+                                        "global_id": global_citation_map[url],
+                                    }
+                                )
+                            break
+                except ValueError:
+                    continue
+
+        # Merge numeric citations with regular ones
+        for url, citations in numeric_citations_by_url.items():
+            if url in citations_by_source:
+                citations_by_source[url].extend(citations)
+            else:
+                citations_by_source[url] = citations
+
         # Check if we have any valid citations to verify
         if not citations_by_source:
             await self.emit_status("info", "No valid citations to verify", False)
@@ -8068,6 +8484,41 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             for batch_result in results:
                 if batch_result:
                     all_results.extend(batch_result)
+
+        # Check for citation numbers that don't match any source
+        for section, section_content in compiled_sections.items():
+            numeric_matches = re.findall(r"\[(\d+)\]", section_content)
+            for num in set(numeric_matches):
+                try:
+                    numeric_id = int(num)
+                    # Check if this number appears in the global citation map values
+                    found_match = False
+                    for url, global_id in global_citation_map.items():
+                        if global_id == numeric_id:
+                            found_match = True
+                            break
+
+                    # If no matching source found, flag this citation
+                    if not found_match:
+                        pattern = (
+                            r"([^.!?]*\["
+                            + re.escape(str(numeric_id))
+                            + r"\][^.!?]*[.!?])"
+                        )
+                        context_matches = re.findall(pattern, section_content)
+                        for context in context_matches:
+                            verification_results["flagged"].append(
+                                {
+                                    "url": "",
+                                    "verified": False,
+                                    "flagged": True,
+                                    "citation_text": context,
+                                    "section": section,
+                                    "global_id": numeric_id,
+                                }
+                            )
+                except ValueError:
+                    continue
 
         # Categorize results
         for result in all_results:
@@ -9394,6 +9845,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
     3. Reflect your own opinions, bias, notions, priorities, or other non-academic impressions of the area of research.
 
     Your outline should conceptually take up the entire space between an introduction and conclusion, filling in the entirety of the research volume.
+    Do NOT allow rendering artifacts, web site UI features, HTML/CSS/underlying website build language, or any other irrelevant text to distract you from your goal.
     Don't add an appendix topic, nor an explicit introduction or conclusion topic. ONLY include the outline in your response.
 	
 	Format your response as a valid JSON object with the following structure:
