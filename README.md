@@ -1,3 +1,268 @@
+## Acknowledgments
+Based on the [Deep Research Open-WebUI Pipe](https://github.com/atineiatte/deep-research-at-home) by atineiatte. He/she did all of this, I just removed the requirement of having Open-WebUI installed. A simple OpenAI compatible API will do the trick.
+
+
+# Deep Research Tool - deOWUIfied :
+
+A powerful autonomous research assistant that conducts comprehensive multi-cycle research using AI and web search. This standalone version is adapted from the original Open-WebUI pipe to work with any OpenAI-compatible API.
+
+## Features
+
+- 🔍 **Multi-cycle autonomous research** - Conducts iterative searches to build comprehensive knowledge
+- 🧠 **Semantic understanding** - Uses embeddings to find conceptually related information
+- 📄 **PDF & web content extraction** - Processes both web pages and PDF documents
+- 🎯 **Smart relevance filtering** - Prioritizes high-quality, relevant sources
+- 📊 **Structured report generation** - Creates academic-style reports with sections and citations
+- 🔄 **Interactive outline refinement** - Adjust research direction based on your preferences
+- 💾 **Intelligent caching** - Reduces API calls and improves performance
+
+## Prerequisites
+
+### Required
+- Python 3.8+
+- OpenAI-compatible API (OpenAI, Anthropic via adapter, local models via LiteLLM, etc.)
+- Search backend (SearXNG recommended)
+
+### Python Dependencies
+```bash
+pip install aiohttp pydantic scikit-learn numpy
+```
+
+### Optional Dependencies
+```bash
+# For better web scraping
+pip install beautifulsoup4
+
+# For PDF processing
+pip install PyPDF2 pdfplumber
+
+# For rotating user agents
+pip install fake-useragent
+```
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/deep-research-tool.git
+cd deep-research-tool
+```
+
+2. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+3. Set up a search backend (see Search Backend Setup below)
+
+## Usage
+
+### Basic Usage
+```bash
+# Using environment variable for API key
+export OPENAI_API_KEY="your-api-key"
+python researchmcp.py "What are the latest developments in quantum computing?"
+
+# Or specify API key directly
+python researchmcp.py "Your research query" --api-key "your-api-key"
+```
+
+### Command Line Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `query` | Your research query (required) | - |
+| `--api-key` | OpenAI API key | `$OPENAI_API_KEY` |
+| `--base-url` | API base URL | `https://api.openai.com/v1` |
+| `--model` | Language model to use | `gpt-3.5-turbo` |
+| `--embedding-model` | Embedding model | `text-embedding-ada-002` |
+| `--search-url` | Search backend URL | `http://localhost:8888/search?q=` |
+| `--max-cycles` | Maximum research cycles | `15` |
+| `--output` | Save results to file | None (prints to console) |
+| `--verbose` | Verbose output | `True` |
+
+### Examples
+
+#### Using OpenAI
+```bash
+export OPENAI_API_KEY="sk-..."
+python researchmcp.py "Impact of climate change on coral reefs"
+```
+
+#### Using Anthropic (via OpenAI adapter)
+```bash
+python researchmcp.py "Latest breakthroughs in cancer research" \
+  --api-key "your-anthropic-key" \
+  --base-url "https://anthropic-openai-adapter.com/v1" \
+  --model "claude-3-sonnet-20240229"
+```
+
+#### Using Local Models (via LiteLLM or similar)
+```bash
+python researchmcp.py "History of artificial intelligence" \
+  --base-url "http://localhost:8000/v1" \
+  --model "local-model-name" \
+  --embedding-model "local-embedding-model"
+```
+
+#### Save Results to File
+```bash
+python researchmcp.py "Renewable energy technologies" \
+  --output "renewable_energy_report.md" \
+  --max-cycles 20
+```
+
+## Search Backend Setup
+
+The tool requires a search backend. We recommend SearXNG:
+
+### Option 1: Docker (Recommended)
+```bash
+docker run -d -p 8888:8080 \
+  -e SEARXNG_BASE_URL=http://localhost:8888/ \
+  -v searxng:/etc/searxng \
+  --name searxng \
+  searx/searxng
+```
+
+### Option 2: Manual Installation
+Follow the [SearXNG installation guide](https://docs.searxng.org/admin/installation.html)
+
+### Option 3: Use Alternative Search API
+Modify the `search_web` method in the script to use your preferred search API (Bing, Google Custom Search, etc.)
+
+## Configuration
+
+You can modify research behavior by editing the `ResearchConfig` class in the script:
+
+```python
+class ResearchConfig:
+    # Model settings
+    RESEARCH_MODEL = "gpt-3.5-turbo"
+    SYNTHESIS_MODEL = ""  # Uses RESEARCH_MODEL if empty
+    
+    # Research cycles
+    MAX_CYCLES = 15
+    MIN_CYCLES = 10
+    
+    # Search parameters
+    SEARCH_RESULTS_PER_QUERY = 3
+    SUCCESSFUL_RESULTS_PER_QUERY = 1
+    
+    # Content processing
+    MAX_RESULT_TOKENS = 4000
+    PDF_MAX_PAGES = 25
+    
+    # Quality filtering
+    QUALITY_FILTER_ENABLED = True
+    QUALITY_SIMILARITY_THRESHOLD = 0.60
+```
+
+## Interactive Features
+
+During research, you can refine the outline when prompted:
+
+### Command-based Selection
+- `/keep 1,3,5-7` or `/k 1,3,5-7` - Keep only specified items
+- `/remove 2,4,8-10` or `/r 2,4,8-10` - Remove specified items
+
+### Natural Language
+- "Focus on historical aspects and avoid technical details"
+- "I'm more interested in practical applications"
+- "Skip the theoretical sections"
+
+## Output Format
+
+The tool generates a comprehensive research report with:
+- Title and subtitle
+- Abstract
+- Introduction
+- Multiple topic sections with analysis
+- Conclusion
+- Bibliography with sources
+
+## Performance Tips
+
+1. **Use caching**: The tool caches embeddings and search results automatically
+2. **Adjust cycles**: Use fewer cycles for quick research, more for comprehensive analysis
+3. **Filter quality**: Enable quality filtering to avoid low-relevance results
+4. **Limit PDFs**: Large PDFs can slow down research; adjust `PDF_MAX_PAGES` if needed
+
+## Troubleshooting
+
+### "No search results found"
+- Check if your search backend is running
+- Verify the search URL is correct
+- Try a simpler query to test connectivity
+
+### "API Error 401"
+- Verify your API key is correct
+- Check if the API base URL matches your provider
+
+### "Rate limit exceeded"
+- The tool includes rate limiting for web scraping
+- Reduce `MAX_CYCLES` or add delays between runs
+
+### Memory issues with large research
+- Reduce `MAX_RESULT_TOKENS`
+- Lower `MAX_CYCLES`
+- Disable PDF processing if not needed
+
+### "'choices' error"
+- The API response format may be incompatible
+- Check that your API endpoint is OpenAI-compatible
+- Verify the model name is supported by your provider
+- Add `--verbose` flag for detailed error messages
+
+## API Compatibility
+
+This tool expects OpenAI-compatible API responses. Compatible providers include:
+
+- **OpenAI** - Direct support
+- **Anthropic** - Via OpenAI compatibility layer
+- **LiteLLM** - Proxy for multiple providers
+- **Ollama** - With OpenAI compatibility mode
+- **vLLM** - OpenAI-compatible server
+- **FastChat** - OpenAI-compatible API
+- **LocalAI** - OpenAI-compatible local models
+
+For embedding models, the tool expects endpoints that support the OpenAI embeddings API format:
+```json
+POST /v1/embeddings
+{
+  "model": "model-name",
+  "input": "text to embed"
+}
+```
+
+## Requirements File
+
+Create a `requirements.txt`:
+```
+aiohttp>=3.8.0
+pydantic>=2.0.0
+scikit-learn>=1.0.0
+numpy>=1.20.0
+beautifulsoup4>=4.9.0
+PyPDF2>=3.0.0
+pdfplumber>=0.9.0
+fake-useragent>=1.4.0
+```
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit issues or pull requests.
+
+## License
+
+Don't make money with this, that's all.
+
+
+
+----------------
+
+Original Readme by atineiatte below : 
+
 ### Deep Research At Home! 
 
 This script performs advanced AI research and returns a comprehensive research report that cites its sources and verifies those citations. 
