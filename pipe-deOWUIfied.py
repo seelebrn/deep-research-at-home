@@ -2041,7 +2041,22 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 source_num += 1
         
         return bibliography if bibliography else "No sources were referenced in this research."
-
+    async def initialize_citation_system(self):
+            """Initialize the citation system for a new research session"""
+            state = self.get_state()
+            
+            # Initialize citation tracking structures
+            if "global_citation_map" not in state:
+                self.update_state("global_citation_map", {})
+            
+            if "master_source_table" not in state:
+                self.update_state("master_source_table", {})
+            
+            if "section_synthesized_content" not in state:
+                self.update_state("section_synthesized_content", {})
+            
+            logger.info("Citation system initialized")
+            # Initialize research state
     async def conduct_research(self, user_query: str) -> str:
         """Main research conductor method"""
         await self.event_emitter.emit_status("info", "Starting deep research...", False)
@@ -2051,6 +2066,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Initialize research
         self.conversation_id = f"research_{hash(user_query)}"
         self.reset_state()
+        await self.initialize_citation_system()
 
         # Generate initial search queries
         await self.event_emitter.emit_status("info", "Generating initial search queries...", False)
@@ -2216,7 +2232,7 @@ Format your response as a valid JSON object:
             all_topics.append(topic_item["topic"])
             all_topics.extend(topic_item.get("subtopics", []))
 
-        # Initialize research state
+    
         await self.initialize_research_state(user_query, research_outline, all_topics, outline_embedding, initial_results)
 
         # Conduct research cycles
@@ -2435,11 +2451,17 @@ Format as JSON:
         for topic_item in synthesis_outline:
             section_title = topic_item["topic"]
             subtopics = topic_item.get("subtopics", [])
-            
+               
             section_content = await self.generate_section_content(
                 section_title, subtopics, user_query, results_history, synthesis_model
             )
             comprehensive_answer += f"## {section_title}\n\n{section_content}\n\n"
+               
+            # Store the section content for bibliography generation
+            state = self.get_state()
+            section_synthesized_content = state.get("section_synthesized_content", {})
+            section_synthesized_content[section_title] = section_content
+            self.update_state("section_synthesized_content", section_synthesized_content)
         
         # Generate conclusion
         conclusion = await self.generate_conclusion(user_query, comprehensive_answer, results_history)
@@ -2623,50 +2645,125 @@ Respond with only the abstract text.""",
             logger.error(f"Error generating abstract: {e}")
             return f"This research report addresses the query: '{user_message}'. It synthesizes information from multiple sources to provide a comprehensive analysis of the topic."
 
-    async def generate_introduction(self, user_query, synthesis_outline, results_history):
-        """Generate introduction section"""
-        intro_prompt = {
-            "role": "system",
-            "content": f"""Write a concise introduction (2-3 paragraphs) for a research report about: "{user_query}".
+async def generate_introduction(self, user_query, synthesis_outline, results_history):
+    """Generate introduction section with citations"""
+    intro_prompt = {
+        "role": "system",
+        "content": f"""Write a concise introduction (2-3 paragraphs) for a research report about: "{user_query}".
 
 The introduction should:
 1. Set the stage for the subject matter
 2. Introduce the research objective
 3. Briefly outline the approach taken
+4. **Include citations [1], [2], etc. when referencing information from research sources**
+
+When you reference information from the research results, add the citation number in brackets immediately after the relevant information.
 
 Respond with only the introduction text.""",
+    }
+
+    # Get citation mappings
+    state = self.get_state()
+    global_citation_map = state.get("global_citation_map", {})
+    
+    # Build context with citations
+    context = f"Research Query: {user_query}\n\n"
+    context += "Research Outline:\n"
+    for section in synthesis_outline:
+        context += f"- {section['topic']}\n"
+    
+    context += f"\nAvailable sources with citation numbers:\n"
+    for result in results_history[:10]:  # First 10 results for context
+        url = result.get("url", "")
+        if url in global_citation_map:
+            citation_num = global_citation_map[url]
+            title = result.get("title", "Untitled")
+            content_preview = result.get("content", "")[:200]
+            context += f"[{citation_num}] {title}\n"
+            context += f"Preview: {content_preview}...\n\n"
+
+    try:
+        response = await self.generate_completion(
+            self.get_synthesis_model(),
+            [intro_prompt, {"role": "user", "content": context}],
+            temperature=self.config.SYNTHESIS_TEMPERATURE * 0.8
+        )
+        return response["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"Error generating introduction: {e}")
+        return f"This research report addresses the query: '{user_query}'. The following sections present findings from a comprehensive investigation of this topic."
+
+    async def generate_conclusion(self, user_query, comprehensive_answer, results_history):
+        """Generate conclusion section with citations"""
+        conclusion_prompt = {
+            "role": "system",
+            "content": f"""Write a comprehensive conclusion (2-4 paragraphs) for a research report about: "{user_query}".
+
+    The conclusion should:
+    1. Restate the research objective
+    2. Highlight the most important findings
+    3. Focus on what we know about the topic
+    4. Provide a definitive summary
+    5. **Include citations [1], [2], etc. when referencing key findings from research sources**
+
+    When you reference specific findings or information, add the citation number in brackets immediately after the relevant information.
+
+    Respond with only the conclusion text.""",
         }
 
-        context = f"Research Query: {user_query}\n\nOutline:\n"
-        for section in synthesis_outline:
-            context += f"- {section['topic']}\n"
+        # Get citation mappings
+        state = self.get_state()
+        global_citation_map = state.get("global_citation_map", {})
+        
+        # Create context with available sources
+        context = f"Research Query: {user_query}\n\n"
+        context += "Key Research Findings (use these for citations):\n"
+        
+        for result in results_history[:10]:  # First 10 results for context
+            url = result.get("url", "")
+            if url in global_citation_map:
+                citation_num = global_citation_map[url]
+                title = result.get("title", "Untitled")
+                content_preview = result.get("content", "")[:300]
+                context += f"[{citation_num}] {title}\n"
+                context += f"Key content: {content_preview}...\n\n"
 
         try:
             response = await self.generate_completion(
                 self.get_synthesis_model(),
-                [intro_prompt, {"role": "user", "content": context}],
-                temperature=self.config.SYNTHESIS_TEMPERATURE * 0.8
+                [conclusion_prompt, {"role": "user", "content": context}],
+                temperature=self.config.SYNTHESIS_TEMPERATURE
             )
             return response["choices"][0]["message"]["content"]
         except Exception as e:
-            logger.error(f"Error generating introduction: {e}")
-            return f"This research report addresses the query: '{user_query}'. The following sections present findings from a comprehensive investigation of this topic."
+            logger.error(f"Error generating conclusion: {e}")
+            return f"This research has provided comprehensive insights into {user_query}, synthesizing information from multiple authoritative sources to address the key aspects of this topic."
+
+
 
     async def generate_section_content(self, section_title, subtopics, user_query, research_results, synthesis_model):
-        """Generate content for a section"""
+        """Generate content for a section with proper citation tracking"""
         section_prompt = {
             "role": "system",
             "content": f"""Write comprehensive content for the section "{section_title}" covering these subtopics: {', '.join(subtopics)}.
 
-The content should:
-1. Address each subtopic thoroughly
-2. Use information from the research results
-3. Be well-structured with clear flow
-4. Be 3-5 paragraphs in length
+    The content should:
+    1. Address each subtopic thoroughly using information from the research results
+    2. Be well-structured with clear flow
+    3. Be 3-5 paragraphs in length
+    4. **CRITICAL: Include citations in the format [1], [2], etc. when referencing information from the research results**
+    5. Use factual information from the provided sources and cite them properly
 
-Focus on factual information and avoid speculation.""",
+    When you reference specific information from a research result, immediately add the citation number in brackets like [1] or [2] after the relevant sentence or claim.
+
+    Focus on factual information and avoid speculation. Every significant claim should be supported by a citation.""",
         }
 
+        # Get current state to track citations
+        state = self.get_state()
+        master_source_table = state.get("master_source_table", {})
+        global_citation_map = state.get("global_citation_map", {})
+        
         # Find relevant results for this section
         relevant_results = []
         section_keywords = section_title.lower().split()
@@ -2674,18 +2771,38 @@ Focus on factual information and avoid speculation.""",
         for result in research_results:
             content = result.get("content", "").lower()
             title = result.get("title", "").lower()
+            url = result.get("url", "")
             
             # Simple relevance check
             if any(keyword in content or keyword in title for keyword in section_keywords):
                 relevant_results.append(result)
+                
+                # Assign citation number if not already assigned
+                if url and url not in global_citation_map:
+                    citation_num = len(global_citation_map) + 1
+                    global_citation_map[url] = citation_num
+        
+        # Update state with citation mappings
+        self.update_state("global_citation_map", global_citation_map)
         
         # Use top 5 most relevant results
         relevant_results = relevant_results[:5]
         
-        context = f"Section: {section_title}\nSubtopics: {', '.join(subtopics)}\n\nRelevant Research Results:\n"
-        for i, result in enumerate(relevant_results):
-            context += f"Result {i+1}: {result.get('title', 'Untitled')}\n"
-            context += f"Content: {result.get('content', '')[:800]}...\n\n"
+        # Create context with citation numbers
+        context = f"Section: {section_title}\nSubtopics: {', '.join(subtopics)}\n\n"
+        context += "Research Results with Citation Numbers:\n"
+        
+        for result in relevant_results:
+            url = result.get("url", "")
+            citation_num = global_citation_map.get(url, "?")
+            title = result.get("title", "Untitled")
+            content_preview = result.get("content", "")[:800]
+            
+            context += f"\n[{citation_num}] Source: {title}\n"
+            context += f"URL: {url}\n"
+            context += f"Content: {content_preview}...\n"
+        
+        context += f"\n\nIMPORTANT: When referencing information from these sources, include the citation number in brackets like [1], [2], etc. immediately after the relevant information."
 
         try:
             response = await self.generate_completion(
@@ -2693,10 +2810,29 @@ Focus on factual information and avoid speculation.""",
                 [section_prompt, {"role": "user", "content": context}],
                 temperature=self.config.SYNTHESIS_TEMPERATURE
             )
-            return response["choices"][0]["message"]["content"]
+            
+            section_content = response["choices"][0]["message"]["content"]
+            
+            # Track which sources were actually cited in this section
+            cited_sources = set()
+            for url, citation_num in global_citation_map.items():
+                if f"[{citation_num}]" in section_content:
+                    cited_sources.add(url)
+                    # Update master source table
+                    if url in master_source_table:
+                        if "cited_in_sections" not in master_source_table[url]:
+                            master_source_table[url]["cited_in_sections"] = set()
+                        master_source_table[url]["cited_in_sections"].add(section_title)
+            
+            # Update master source table state
+            self.update_state("master_source_table", master_source_table)
+            
+            return section_content
+            
         except Exception as e:
             logger.error(f"Error generating section content: {e}")
             return f"This section covers {section_title} with focus on {', '.join(subtopics)}. Content synthesis encountered an error."
+
 
     async def generate_conclusion(self, user_query, comprehensive_answer, results_history):
         """Generate conclusion section"""
