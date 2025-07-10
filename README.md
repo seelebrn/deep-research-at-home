@@ -10,6 +10,7 @@ Simplified the whole process a bit, it's still incredibly strong.
 And a few little tweaks here and there.
 
 Have fun and enjoy superior reasoning power (and responsibilities) !
+
 ~Cadenza
 
 # Deep Research Tool - deOWUIfied :
