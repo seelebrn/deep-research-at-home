@@ -2018,45 +2018,94 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             return embedding
 
     async def generate_bibliography_simple(self, results_history: List[Dict]) -> str:
-        """Generate simple bibliography from results"""
+        """Generate bibliography with proper citation numbering - only includes actually cited sources"""
         if not results_history:
             return "No sources were referenced in this research."
         
-        bibliography = ""
-        source_num = 1
-        seen_urls = set()
+        state = self.get_state()
+        global_citation_map = state.get("global_citation_map", {})
+        master_source_table = state.get("master_source_table", {})
         
-        for result in results_history:
-            url = result.get("url", "")
-            title = result.get("title", "Untitled Source")
+        # If no global citation map exists, create one
+        if not global_citation_map:
+            seen_urls = set()
+            citation_num = 1
             
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                if url.startswith("http"):
-                    url_formatted = f"[{url}]({url})"
-                else:
-                    url_formatted = url
+            for result in results_history:
+                url = result.get("url", "")
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    global_citation_map[url] = citation_num
+                    citation_num += 1
+            
+            self.update_state("global_citation_map", global_citation_map)
+        
+        # Get all section content to find which sources are actually cited
+        section_synthesized_content = state.get("section_synthesized_content", {})
+        
+        # Find all citation numbers actually used in the text
+        cited_numbers = set()
+        all_content = ""
+        
+        # Combine all section content
+        for section_content in section_synthesized_content.values():
+            all_content += section_content + "\n\n"
+        
+        # Extract citation numbers from text
+        citation_matches = re.findall(r'\[(\d+)\]', all_content)
+        for match in citation_matches:
+            try:
+                cited_numbers.add(int(match))
+            except ValueError:
+                continue
+        
+        # Build bibliography only for actually cited sources
+        bibliography = ""
+        cited_sources = []
+        
+        # Create list of cited sources sorted by citation number
+        for url, citation_num in global_citation_map.items():
+            if citation_num in cited_numbers:
+                # Find the corresponding result
+                result_info = None
+                for result in results_history:
+                    if result.get("url") == url:
+                        result_info = result
+                        break
                 
-                bibliography += f"[{source_num}] {title}. {url_formatted}\n\n"
-                source_num += 1
+                if result_info:
+                    title = result_info.get("title", "Untitled Source")
+                    
+                    # Clean up title if needed
+                    if title.startswith("Result for") or title == url:
+                        if url in master_source_table:
+                            title = master_source_table[url].get("title", title)
+                    
+                    cited_sources.append({
+                        "citation_num": citation_num,
+                        "title": title,
+                        "url": url
+                    })
+        
+        # Sort by citation number
+        cited_sources.sort(key=lambda x: x["citation_num"])
+        
+        # Generate bibliography
+        for source in cited_sources:
+            citation_num = source["citation_num"]
+            title = source["title"]
+            url = source["url"]
+            
+            # Format URL as markdown link
+            if url.startswith("http"):
+                url_formatted = f"[{url}]({url})"
+            else:
+                url_formatted = url
+            
+            bibliography += f"[{citation_num}] {title}. {url_formatted}\n\n"
         
         return bibliography if bibliography else "No sources were referenced in this research."
-    async def initialize_citation_system(self):
-            """Initialize the citation system for a new research session"""
-            state = self.get_state()
-            
-            # Initialize citation tracking structures
-            if "global_citation_map" not in state:
-                self.update_state("global_citation_map", {})
-            
-            if "master_source_table" not in state:
-                self.update_state("master_source_table", {})
-            
-            if "section_synthesized_content" not in state:
-                self.update_state("section_synthesized_content", {})
-            
-            logger.info("Citation system initialized")
-            # Initialize research state
+
     async def conduct_research(self, user_query: str) -> str:
         """Main research conductor method"""
         await self.event_emitter.emit_status("info", "Starting deep research...", False)
@@ -2066,7 +2115,6 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Initialize research
         self.conversation_id = f"research_{hash(user_query)}"
         self.reset_state()
-        await self.initialize_citation_system()
 
         # Generate initial search queries
         await self.event_emitter.emit_status("info", "Generating initial search queries...", False)
@@ -2167,26 +2215,36 @@ Format your response as a valid JSON object:
                 {"topic": "Detailed Analysis", "subtopics": ["Specific Aspects", "Examples"]},
             ]
 
-        # Display outline
+        # Display outline with numbering for feedback
         outline_text = "### Research Outline\n\n"
+        item_number = 1
         for topic in research_outline:
-            outline_text += f"**{topic['topic']}**\n"
+            outline_text += f"**{item_number}. {topic['topic']}**\n"
             for subtopic in topic.get("subtopics", []):
-                outline_text += f"- {subtopic}\n"
+                outline_text += f"   - {subtopic}\n"
             outline_text += "\n"
+            item_number += 1
 
         await self.event_emitter.emit_message(outline_text)
 
-        # Interactive outline feedback (re-enabled)
+        # Create flat list of topics BEFORE interactive section
+        all_topics = []
+        for topic_item in research_outline:
+            all_topics.append(topic_item["topic"])
+            all_topics.extend(topic_item.get("subtopics", []))
+
+        # Interactive outline feedback
         if self.config.INTERACTIVE_RESEARCH:
             await self.event_emitter.emit_message("\n### 🔍 Research Outline Feedback\n\n")
             await self.event_emitter.emit_message("**Please provide feedback on this research outline.**\n\n")
             await self.event_emitter.emit_message("You can:\n")
             await self.event_emitter.emit_message("- Use commands like `/keep 1,3,5-7` or `/remove 2,4,8-10` to select specific items by number\n")
+            await self.event_emitter.emit_message("- Add custom search queries with `/query \"your search terms\"`\n")
             await self.event_emitter.emit_message("- Or simply describe what topics you want to focus on or avoid in natural language\n\n")
             await self.event_emitter.emit_message("Examples:\n")
             await self.event_emitter.emit_message("- `/k 1,3,5-7` (keep only items 1,3,5,6,7)\n")
             await self.event_emitter.emit_message("- `/r 2,4,8-10` (remove items 2,4,8,9,10)\n")
+            await self.event_emitter.emit_message("- `/query \"machine learning applications\"` (add custom search)\n")
             await self.event_emitter.emit_message('- "Focus on historical aspects and avoid technical details"\n')
             await self.event_emitter.emit_message('- "I\'m more interested in practical applications"\n\n')
             await self.event_emitter.emit_message("If you want to continue with all items, just press Enter or type 'continue'.\n\n")
@@ -2197,27 +2255,119 @@ Format your response as a valid JSON object:
                 user_feedback = input().strip()
                 
                 if user_feedback and user_feedback.lower() != 'continue':
-                    # Process the feedback
-                    feedback_result = await self.process_outline_feedback_cli(
-                        user_feedback, research_outline, all_topics, user_query
-                    )
+                    # Check if user wants to add custom queries
+                    custom_queries = []
+                    if user_feedback.startswith('/query '):
+                        # Extract custom query
+                        query_match = re.search(r'/query\s+["\']([^"\']+)["\']', user_feedback)
+                        if query_match:
+                            custom_query = query_match.group(1)
+                            custom_queries.append(custom_query)
+                            await self.event_emitter.emit_message(f"✅ **Added custom search query:** {custom_query}\n\n")
+                            
+                            # Execute custom query immediately
+                            await self.event_emitter.emit_message("🔍 **Executing custom search query...**\n\n")
+                            try:
+                                query_embedding = await self.get_embedding(custom_query)
+                                if not query_embedding:
+                                    query_embedding = [0] * 1536
+                                
+                                custom_results = await self.process_query(custom_query, query_embedding, outline_embedding)
+                                initial_results.extend(custom_results)
+                                
+                                await self.event_emitter.emit_message(f"✅ **Found {len(custom_results)} additional results from custom query**\n\n")
+                                
+                                # Update research outline with insights from custom query
+                                if custom_results:
+                                    await self.event_emitter.emit_message("🔄 **Updating research outline with new insights...**\n\n")
+                                    
+                                    # Create context for outline update
+                                    new_context = f"Custom query: {custom_query}\n\nNew results:\n"
+                                    for i, result in enumerate(custom_results[:3]):  # Top 3 results
+                                        new_context += f"Result {i+1}: {result['title']}\n"
+                                        new_context += f"Content: {result['content'][:300]}...\n\n"
+                                    
+                                    # Generate additional topics based on custom query results
+                                    topic_expansion_prompt = {
+                                        "role": "system",
+                                        "content": f"""Based on the custom search query and results, suggest 2-3 additional research topics that should be added to the outline for: "{user_query}".
+
+        The topics should:
+        1. Be directly relevant to both the original query and the custom search
+        2. Be specific and actionable for research
+        3. Add value to the existing outline
+
+        Format as JSON:
+        {{"new_topics": ["Topic 1", "Topic 2", "Topic 3"]}}""",
+                                    }
+                                    
+                                    try:
+                                        expansion_response = await self.generate_completion(
+                                            self.get_research_model(),
+                                            [topic_expansion_prompt, {"role": "user", "content": new_context}],
+                                            temperature=self.config.TEMPERATURE
+                                        )
+                                        expansion_content = expansion_response["choices"][0]["message"]["content"]
+                                        
+                                        expansion_json_str = expansion_content[expansion_content.find("{"):expansion_content.rfind("}") + 1]
+                                        expansion_data = json.loads(expansion_json_str)
+                                        new_topics = expansion_data.get("new_topics", [])
+                                        
+                                        if new_topics:
+                                            await self.event_emitter.emit_message("**New topics discovered from custom query:**\n")
+                                            for topic in new_topics:
+                                                await self.event_emitter.emit_message(f"+ {topic}\n")
+                                                all_topics.append(topic)
+                                            await self.event_emitter.emit_message("\n")
+                                            
+                                            # Add to research outline
+                                            research_outline.append({
+                                                "topic": "Custom Research Areas",
+                                                "subtopics": new_topics
+                                            })
+                                            
+                                    except Exception as e:
+                                        logger.error(f"Error expanding outline with custom query: {e}")
+                                        await self.event_emitter.emit_message("⚠️ Could not auto-expand outline, but custom results were added.\n\n")
+                            
+                            except Exception as e:
+                                logger.error(f"Error executing custom query: {e}")
+                                await self.event_emitter.emit_message(f"⚠️ Error executing custom query: {e}\n\n")
+                        
+                        # Check if there are other feedback commands after custom query
+                        remaining_feedback = re.sub(r'/query\s+["\'][^"\']+["\']', '', user_feedback).strip()
+                        if remaining_feedback:
+                            user_feedback = remaining_feedback
+                        else:
+                            user_feedback = ""
                     
-                    if feedback_result:
-                        # Update research outline based on feedback
-                        research_outline = feedback_result.get("updated_outline", research_outline)
-                        all_topics = feedback_result.get("updated_topics", all_topics)
+                    # Process regular feedback (outline modifications)
+                    if user_feedback:
+                        try:
+                            feedback_result = await self.process_outline_feedback_cli(
+                                user_feedback, research_outline, all_topics, user_query
+                            )
+                        except Exception as e:
+                            logger.error(f"Error processing feedback: {e}")
+                            await self.event_emitter.emit_message(f"Error processing feedback: {e}\n")
+                            feedback_result = None
                         
-                        # Re-display updated outline
-                        await self.event_emitter.emit_message("\n### ✅ Updated Research Outline\n\n")
-                        for topic in research_outline:
-                            await self.event_emitter.emit_message(f"**{topic['topic']}**\n")
-                            for subtopic in topic.get("subtopics", []):
-                                await self.event_emitter.emit_message(f"- {subtopic}\n")
-                            await self.event_emitter.emit_message("\n")
-                        
-                        # Re-create outline embedding
-                        outline_text = " ".join(all_topics)
-                        outline_embedding = await self.get_embedding(outline_text)
+                        if feedback_result:
+                            # Update research outline based on feedback
+                            research_outline = feedback_result.get("updated_outline", research_outline)
+                            all_topics = feedback_result.get("updated_topics", all_topics)
+                            
+                            # Re-display updated outline
+                            await self.event_emitter.emit_message("\n### ✅ Updated Research Outline\n\n")
+                            for topic in research_outline:
+                                await self.event_emitter.emit_message(f"**{topic['topic']}**\n")
+                                for subtopic in topic.get("subtopics", []):
+                                    await self.event_emitter.emit_message(f"- {subtopic}\n")
+                                await self.event_emitter.emit_message("\n")
+                            
+                            # Re-create outline embedding with updated topics
+                            outline_text = " ".join(all_topics)
+                            outline_embedding = await self.get_embedding(outline_text)
                 
                 await self.event_emitter.emit_message("*Continuing with research outline...*\n\n")
                 
@@ -2226,13 +2376,7 @@ Format your response as a valid JSON object:
         else:
             await self.event_emitter.emit_message("*Interactive research disabled, continuing with outline...*\n\n")
 
-        # Create flat list of topics
-        all_topics = []
-        for topic_item in research_outline:
-            all_topics.append(topic_item["topic"])
-            all_topics.extend(topic_item.get("subtopics", []))
-
-    
+        # Initialize research state
         await self.initialize_research_state(user_query, research_outline, all_topics, outline_embedding, initial_results)
 
         # Conduct research cycles
@@ -2309,7 +2453,7 @@ Format as JSON:
 }}""",
                 }
 
-                analysis_context = f"Current topics: {', '.join(active_outline)}\n\n"
+                analysis_context = f"Current topics: {', '.join([str(topic) for topic in active_outline])}\n\n"
                 analysis_context += "Latest results:\n"
                 for i, result in enumerate(cycle_results):
                     analysis_context += f"Result {i+1}: {result['title']}\n"
@@ -2451,17 +2595,11 @@ Format as JSON:
         for topic_item in synthesis_outline:
             section_title = topic_item["topic"]
             subtopics = topic_item.get("subtopics", [])
-               
+            
             section_content = await self.generate_section_content(
                 section_title, subtopics, user_query, results_history, synthesis_model
             )
             comprehensive_answer += f"## {section_title}\n\n{section_content}\n\n"
-               
-            # Store the section content for bibliography generation
-            state = self.get_state()
-            section_synthesized_content = state.get("section_synthesized_content", {})
-            section_synthesized_content[section_title] = section_content
-            self.update_state("section_synthesized_content", section_synthesized_content)
         
         # Generate conclusion
         conclusion = await self.generate_conclusion(user_query, comprehensive_answer, results_history)
@@ -2645,101 +2783,34 @@ Respond with only the abstract text.""",
             logger.error(f"Error generating abstract: {e}")
             return f"This research report addresses the query: '{user_message}'. It synthesizes information from multiple sources to provide a comprehensive analysis of the topic."
 
-async def generate_introduction(self, user_query, synthesis_outline, results_history):
-    """Generate introduction section with citations"""
-    intro_prompt = {
-        "role": "system",
-        "content": f"""Write a concise introduction (2-3 paragraphs) for a research report about: "{user_query}".
+    async def generate_introduction(self, user_query, synthesis_outline, results_history):
+        """Generate introduction section"""
+        intro_prompt = {
+            "role": "system",
+            "content": f"""Write a concise introduction (2-3 paragraphs) for a research report about: "{user_query}".
 
 The introduction should:
 1. Set the stage for the subject matter
 2. Introduce the research objective
 3. Briefly outline the approach taken
-4. **Include citations [1], [2], etc. when referencing information from research sources**
-
-When you reference information from the research results, add the citation number in brackets immediately after the relevant information.
 
 Respond with only the introduction text.""",
-    }
-
-    # Get citation mappings
-    state = self.get_state()
-    global_citation_map = state.get("global_citation_map", {})
-    
-    # Build context with citations
-    context = f"Research Query: {user_query}\n\n"
-    context += "Research Outline:\n"
-    for section in synthesis_outline:
-        context += f"- {section['topic']}\n"
-    
-    context += f"\nAvailable sources with citation numbers:\n"
-    for result in results_history[:10]:  # First 10 results for context
-        url = result.get("url", "")
-        if url in global_citation_map:
-            citation_num = global_citation_map[url]
-            title = result.get("title", "Untitled")
-            content_preview = result.get("content", "")[:200]
-            context += f"[{citation_num}] {title}\n"
-            context += f"Preview: {content_preview}...\n\n"
-
-    try:
-        response = await self.generate_completion(
-            self.get_synthesis_model(),
-            [intro_prompt, {"role": "user", "content": context}],
-            temperature=self.config.SYNTHESIS_TEMPERATURE * 0.8
-        )
-        return response["choices"][0]["message"]["content"]
-    except Exception as e:
-        logger.error(f"Error generating introduction: {e}")
-        return f"This research report addresses the query: '{user_query}'. The following sections present findings from a comprehensive investigation of this topic."
-
-    async def generate_conclusion(self, user_query, comprehensive_answer, results_history):
-        """Generate conclusion section with citations"""
-        conclusion_prompt = {
-            "role": "system",
-            "content": f"""Write a comprehensive conclusion (2-4 paragraphs) for a research report about: "{user_query}".
-
-    The conclusion should:
-    1. Restate the research objective
-    2. Highlight the most important findings
-    3. Focus on what we know about the topic
-    4. Provide a definitive summary
-    5. **Include citations [1], [2], etc. when referencing key findings from research sources**
-
-    When you reference specific findings or information, add the citation number in brackets immediately after the relevant information.
-
-    Respond with only the conclusion text.""",
         }
 
-        # Get citation mappings
-        state = self.get_state()
-        global_citation_map = state.get("global_citation_map", {})
-        
-        # Create context with available sources
-        context = f"Research Query: {user_query}\n\n"
-        context += "Key Research Findings (use these for citations):\n"
-        
-        for result in results_history[:10]:  # First 10 results for context
-            url = result.get("url", "")
-            if url in global_citation_map:
-                citation_num = global_citation_map[url]
-                title = result.get("title", "Untitled")
-                content_preview = result.get("content", "")[:300]
-                context += f"[{citation_num}] {title}\n"
-                context += f"Key content: {content_preview}...\n\n"
+        context = f"Research Query: {user_query}\n\nOutline:\n"
+        for section in synthesis_outline:
+            context += f"- {section['topic']}\n"
 
         try:
             response = await self.generate_completion(
                 self.get_synthesis_model(),
-                [conclusion_prompt, {"role": "user", "content": context}],
-                temperature=self.config.SYNTHESIS_TEMPERATURE
+                [intro_prompt, {"role": "user", "content": context}],
+                temperature=self.config.SYNTHESIS_TEMPERATURE * 0.8
             )
             return response["choices"][0]["message"]["content"]
         except Exception as e:
-            logger.error(f"Error generating conclusion: {e}")
-            return f"This research has provided comprehensive insights into {user_query}, synthesizing information from multiple authoritative sources to address the key aspects of this topic."
-
-
+            logger.error(f"Error generating introduction: {e}")
+            return f"This research report addresses the query: '{user_query}'. The following sections present findings from a comprehensive investigation of this topic."
 
     async def generate_section_content(self, section_title, subtopics, user_query, research_results, synthesis_model):
         """Generate content for a section with proper citation tracking"""
@@ -2832,6 +2903,7 @@ Respond with only the introduction text.""",
         except Exception as e:
             logger.error(f"Error generating section content: {e}")
             return f"This section covers {section_title} with focus on {', '.join(subtopics)}. Content synthesis encountered an error."
+
 
 
     async def generate_conclusion(self, user_query, comprehensive_answer, results_history):
@@ -3212,30 +3284,6 @@ Format as JSON:
             })
         
         return outline
-        if not results_history:
-            return "No sources were referenced in this research."
-
-        bibliography = ""
-        source_num = 1
-        seen_urls = set()
-
-        for result in results_history:
-            url = result.get("url", "")
-            title = result.get("title", "Untitled Source")
-            
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                if url.startswith("http"):
-                    url_formatted = f"[{url}]({url})"
-                else:
-                    url_formatted = url
-                
-                bibliography += f"[{source_num}] {title}. {url_formatted}\n\n"
-                source_num += 1
-
-        return bibliography if bibliography else "No sources were referenced in this research."
-
-
 async def main():
     """Main CLI function"""
     parser = argparse.ArgumentParser(description="Deep Research Tool - Standalone Version")
@@ -3263,15 +3311,8 @@ async def main():
     config.EMBEDDING_MODEL = args.embedding_model
     config.SEARCH_URL = args.search_url
     config.MAX_CYCLES = args.max_cycles
-    # Apply command line arguments to override defaults
-    config.OPENAI_API_KEY = args.api_key
-    config.OPENAI_BASE_URL = args.base_url
-    config.RESEARCH_MODEL = args.model
-    config.EMBEDDING_MODEL = args.embedding_model
-    config.SEARCH_URL = args.search_url
-    config.MAX_CYCLES = args.max_cycles
     config.QUALITY_FILTER_MODEL = args.model  # Use same model for quality filtering
-    config.SYNTHESIS_MODEL = args.model or args.model  # Use same model for synthesis
+    config.SYNTHESIS_MODEL = args.model  # Use same model for synthesis
 
     # Add debug output to verify the config is correct
     print(f"🔧 Configuration:")
@@ -3280,6 +3321,7 @@ async def main():
     print(f"   Research Model: {config.RESEARCH_MODEL}")
     print(f"   Embedding Model: {config.EMBEDDING_MODEL}")
     print(f"   Search URL: {config.SEARCH_URL}")
+    
     # Create event emitter
     event_emitter = EventEmitter(verbose=args.verbose)
     
@@ -3319,5 +3361,7 @@ async def main():
         print(f"❌ Error during research: {e}")
         logger.error(f"Research error: {e}")
 
+        
+        
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main()) 
