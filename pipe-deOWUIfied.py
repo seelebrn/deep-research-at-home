@@ -48,14 +48,14 @@ class ResearchConfig:
     """Configuration class replacing Open-WebUI valves"""
     def __init__(self):
         # Core API settings
-        self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-        self.OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")
+        self.OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
         
         # Model settings
         self.ENABLED = True
         self.RESEARCH_MODEL = "gpt-3.5-turbo"
         self.SYNTHESIS_MODEL = ""  # Use RESEARCH_MODEL if empty
-        self.EMBEDDING_MODEL = "text-embedding-ada-002"
+        self.EMBEDDING_MODEL = "nomic-embed-text:v1.5"
         self.QUALITY_FILTER_MODEL = "gpt-3.5-turbo"
 
         # Quality filtering
@@ -3127,7 +3127,23 @@ async def main():
     config.EMBEDDING_MODEL = args.embedding_model
     config.SEARCH_URL = args.search_url
     config.MAX_CYCLES = args.max_cycles
-    
+    # Apply command line arguments to override defaults
+    config.OPENAI_API_KEY = args.api_key
+    config.OPENAI_BASE_URL = args.base_url
+    config.RESEARCH_MODEL = args.model
+    config.EMBEDDING_MODEL = args.embedding_model
+    config.SEARCH_URL = args.search_url
+    config.MAX_CYCLES = args.max_cycles
+    config.QUALITY_FILTER_MODEL = args.model  # Use same model for quality filtering
+    config.SYNTHESIS_MODEL = args.model or args.model  # Use same model for synthesis
+
+    # Add debug output to verify the config is correct
+    print(f"🔧 Configuration:")
+    print(f"   API Key: {config.OPENAI_API_KEY}")
+    print(f"   Base URL: {config.OPENAI_BASE_URL}")
+    print(f"   Research Model: {config.RESEARCH_MODEL}")
+    print(f"   Embedding Model: {config.EMBEDDING_MODEL}")
+    print(f"   Search URL: {config.SEARCH_URL}")
     # Create event emitter
     event_emitter = EventEmitter(verbose=args.verbose)
     
