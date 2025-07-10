@@ -1,7 +1,7 @@
 ## Acknowledgments
 Based on the [Deep Research Open-WebUI Pipe](https://github.com/atineiatte/deep-research-at-home) by atineiatte. He/she did all the heavy lifting.
 
-I just removed every open-webui reference and adapted the script to a simple OpenAI compatible API. 
+I just cut all ties with open-webui and adapted the script to a simple OpenAI compatible API, also add command line args to optimize the whole process. 
 
 Made a little fast config script too, that can't be bad.
 
@@ -9,6 +9,8 @@ Simplified the whole process a bit, it's still incredibly strong.
 
 And a few little tweaks here and there.
 
+Have fun and enjoy superior reasoning power (and responsibilities) !
+~Cadenza
 
 # Deep Research Tool - deOWUIfied :
 
