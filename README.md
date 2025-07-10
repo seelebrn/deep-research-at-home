@@ -1,5 +1,8 @@
 ## Acknowledgments
-Based on the [Deep Research Open-WebUI Pipe](https://github.com/atineiatte/deep-research-at-home) by atineiatte. He/she did all of this, I just removed the requirement of having Open-WebUI installed. A simple OpenAI compatible API will do the trick.
+Based on the [Deep Research Open-WebUI Pipe](https://github.com/atineiatte/deep-research-at-home) by atineiatte. He/she did all the heavy lifting.
+I just removed every open-webui reference and adapted the script to a simple OpenAI compatible API. 
+Made a little fast config script too, that can't be bad.
+Simplified the whole process a bit, it's still incredibly strong.
 
 
 # Deep Research Tool - deOWUIfied :
