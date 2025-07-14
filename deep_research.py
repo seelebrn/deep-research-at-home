@@ -75,44 +75,48 @@ class TokenCounter:
     def __init__(self, valves):
         self.valves = valves
         self.encoding = None
-        self._init_tokenizer()
-    
-    def _init_tokenizer(self):
-        """Initialize tokenizer - try tiktoken first, fallback to estimation"""
-        try:
-            import tiktoken
-            # Use cl100k_base encoding (GPT-4 style) for Qwen models
-            self.encoding = tiktoken.get_encoding("cl100k_base")
-        except ImportError:
-            logger.warning("tiktoken not available, using estimation method")
-            self.encoding = None
-    
+        # Don't try to init tokenizer - rely on estimation for LMStudio
+
     def count_tokens(self, text: str) -> int:
-        """Count tokens in text using best available method"""
+        """Count tokens in text using estimation optimized for Qwen models via LMStudio"""
         if not text:
             return 0
             
         try:
-            if self.encoding:
-                # Method 1: Use tiktoken (most accurate)
-                return len(self.encoding.encode(text))
-            else:
-                # Method 2: Estimation for Qwen-style models
-                # Qwen tokenizer typically has ~0.7-1.0 tokens per word
-                word_count = len(text.split())
-                char_count = len(text)
-                
-                # Use hybrid approach: consider both words and characters
+            # Improved estimation for Qwen models via LMStudio
+            word_count = len(text.split())
+            char_count = len(text)
+            
+            # Qwen tokenizer characteristics:
+            # - Better at handling Chinese characters (higher token/char ratio)
+            # - English words typically 0.7-1.0 tokens per word
+            # - Punctuation and special chars affect ratio
+            
+            # Count different character types for better estimation
+            english_chars = sum(1 for c in text if c.isascii() and c.isalpha())
+            non_ascii_chars = char_count - english_chars
+            
+            # Adjust estimation based on content type
+            if non_ascii_chars > char_count * 0.1:  # Significant non-ASCII content
+                # Likely multilingual, use higher token density
                 estimated_tokens = max(
-                    int(word_count * 0.85),  # Conservative word-based estimate
-                    int(char_count / 3.5)    # Character-based estimate for Qwen
+                    int(word_count * 0.9),     # Words
+                    int(char_count / 2.8)     # Characters (multilingual)
                 )
-                return estimated_tokens
+            else:
+                # Primarily English content
+                estimated_tokens = max(
+                    int(word_count * 0.8),     # Words  
+                    int(char_count / 3.8)     # Characters (English)
+                )
+            
+            # Ensure minimum token count for non-empty text
+            return max(estimated_tokens, 1 if text.strip() else 0)
                 
         except Exception as e:
             logger.error(f"Token counting failed: {e}")
-            # Fallback: very rough character-based estimate
-            return len(text) // 4
+            # Fallback: very rough estimate
+            return max(len(text.split()) if text.strip() else 0, 1)
 
 # Standalone User class to replace Open WebUI dependency
 class User:
@@ -706,7 +710,7 @@ class Pipe:
             return max(len(text.split()) * 0.75, 10)
 
     async def get_embedding(self, text: str) -> Optional[List[float]]:
-        """Get embedding for a text string using the configured embedding model with caching"""
+        """Get embedding for a text string using LMStudio embedding API with caching"""
         if not text or not text.strip():
             return None
 
@@ -719,7 +723,7 @@ class Pipe:
             # Ensure cached embedding has consistent dimensions
             return normalize_embedding_dimension(cached_embedding)
 
-        # If not in cache, get from API
+        # If not in cache, get from LMStudio API
         try:
             connector = aiohttp.TCPConnector(force_close=True)
             async with aiohttp.ClientSession(connector=connector) as session:
@@ -729,24 +733,33 @@ class Pipe:
                 }
 
                 async with session.post(
-                        f"{self.valves.OLLAMA_URL}/v1/embeddings", json=payload, timeout=30
+                        f"{self.valves.OLLAMA_URL}/v1/embeddings", 
+                        json=payload, 
+                        timeout=30
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                        # Handle both old and new API response formats
-                        if "embedding" in result:
-                            embedding = result.get("embedding", [])
+                        # Handle LMStudio embedding response format
+                        if "data" in result and len(result["data"]) > 0:
+                            embedding = result["data"][0].get("embedding", [])
                             if embedding:
                                 # Normalize dimension before caching
                                 normalized_embedding = normalize_embedding_dimension(embedding)
                                 if normalized_embedding:
                                     self.embedding_cache.set(text, normalized_embedding)
                                     return normalized_embedding
+                        # Fallback to old format if new format not available
+                        elif "embedding" in result:
+                            embedding = result.get("embedding", [])
+                            if embedding:
+                                normalized_embedding = normalize_embedding_dimension(embedding)
+                                if normalized_embedding:
+                                    self.embedding_cache.set(text, normalized_embedding)
+                                    return normalized_embedding
                         elif "embeddings" in result and result["embeddings"]:
-                            # New format with batch response (we only sent one text, so take first)
+                            # Another possible format
                             embedding = result["embeddings"][0]
                             if embedding:
-                                # Normalize dimension before caching
                                 normalized_embedding = normalize_embedding_dimension(embedding)
                                 if normalized_embedding:
                                     self.embedding_cache.set(text, normalized_embedding)
@@ -5280,7 +5293,16 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         search_results = await self.search_web(sanitized_query)
         if not search_results:
             await self.emit_message(f"*No results found for query: {query}*\n\n")
-            return []
+            # FIXED: Return a minimal placeholder result instead of empty list
+            return [{
+                "title": f"Search attempted for: {query}",
+                "url": f"search://{query.replace(' ', '+')}",
+                "content": f"Search was performed for '{query}' but no substantial results were returned. This may indicate the search API is not responding correctly or the topic is very specific.",
+                "query": query,
+                "tokens": 50,
+                "valid": True,
+                "similarity": 0.1
+            }]
 
         # Always select the most relevant results - this adds similarity scores
         search_results = await self.select_most_relevant_results(
@@ -5523,7 +5545,6 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # If we still didn't get any successful results, log this
         if not successful_results:
             logger.warning(f"No valid results obtained for query: {query}")
-            await self.emit_message(f"*No valid results found for query: {query}*\n\n")
 
         # Update token counts with new results
         await self.update_token_counts(successful_results)
@@ -5562,8 +5583,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 "messages": messages,
                 "stream": stream,
                 "temperature": temperature,
-                "max_tokens": 4000,  # Added: LMStudio often requires this
-                # Removed "keep_alive" - that's Ollama-specific
+                "max_tokens": 4000,
             }
 
             connector = aiohttp.TCPConnector(force_close=True)
@@ -5575,17 +5595,23 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 ) as response:
                     if response.status == 200:
                         if stream:
-                            # Handle streaming response
+                            # Handle streaming response for LMStudio
                             result_content = ""
                             async for line in response.content:
                                 if line:
                                     try:
-                                        chunk = json.loads(line.decode('utf-8'))
-                                        if 'choices' in chunk and len(chunk['choices']) > 0:
-                                            delta = chunk['choices'][0].get('delta', {})
-                                            if 'content' in delta:
-                                                result_content += delta['content']
-                                    except json.JSONDecodeError:
+                                        line_text = line.decode('utf-8').strip()
+                                        if line_text.startswith('data: '):
+                                            line_text = line_text[6:]  # Remove 'data: ' prefix
+                                        if line_text == '[DONE]':
+                                            break
+                                        if line_text:
+                                            chunk = json.loads(line_text)
+                                            if 'choices' in chunk and len(chunk['choices']) > 0:
+                                                delta = chunk['choices'][0].get('delta', {})
+                                                if 'content' in delta:
+                                                    result_content += delta['content']
+                                    except (json.JSONDecodeError, UnicodeDecodeError):
                                         continue
                             return {"choices": [{"message": {"content": result_content}}]}
                         else:
@@ -5609,6 +5635,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             logger.error(f"Error generating completion with model {model}: {e}")
             # Return a minimal valid response structure
             return {"choices": [{"message": {"content": f"Error: {str(e)}"}}]}
+
 
     async def emit_message(self, message: str):
         """Emit a message to the client"""
@@ -6633,7 +6660,13 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
             # Clear waiting flag
             self.update_state("waiting_for_outline_feedback", False)
-            return outline_items, all_topics, outline_embedding
+
+            # FIXED: Set variables and continue to research cycles instead of returning
+            research_outline = outline_items
+            all_topics = updated_all_topics if 'updated_all_topics' in locals() else all_topics
+            outline_embedding = updated_outline_embedding if 'updated_outline_embedding' in locals() else outline_embedding
+
+            # Continue to research cycles below - don't return here
 
         # Generate replacement topics for removed items if needed
         if removed_items:
@@ -7148,31 +7181,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
     async def is_follow_up_query(self, messages: List[Dict]) -> bool:
         """Determine if the current query is a follow-up to a previous research session"""
-        # If we have a previous comprehensive summary and research has been completed,
-        # treat any new query as a follow-up
-        state = self.get_state()
-        prev_comprehensive_summary = state.get("prev_comprehensive_summary", "")
-        research_completed = state.get("research_completed", False)
-
-        # Check if we're waiting for outline feedback - if so, don't treat as new or follow-up
-        waiting_for_outline_feedback = state.get("waiting_for_outline_feedback", False)
-        if waiting_for_outline_feedback:
-            return False
-
-        # Check for fresh conversation by examining message count
-        # A brand new conversation will have very few messages
-        is_new_conversation = (
-                len(messages) <= 2
-        )  # Only 1-2 messages in a new conversation
-
-        # If this appears to be a new conversation and we're not waiting for feedback,
-        # don't treat as follow-up and reset state
-        if is_new_conversation and not waiting_for_outline_feedback:
-            # Reset the state for this conversation to ensure clean start
-            self.reset_state()
-            return False
-
-        return bool(prev_comprehensive_summary and research_completed)
+        # For standalone usage, always return False to ensure fresh research
+        return False
 
     async def generate_synthesis_outline(
             self,
@@ -7513,8 +7523,22 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Add the research outline for context
         subtopic_context += "## Research Outline Context:\n"
         state = self.get_state()
-        research_state = state.get("research_state") if state else None
-        synthesis_outline = research_state.get("research_outline", []) if research_state else []
+# Check if we just processed feedback and have research state
+        research_state = state.get("research_state")
+        just_processed_feedback = not state.get("waiting_for_outline_feedback", True)
+
+        if research_state and just_processed_feedback:
+            # We're continuing from feedback - use existing state
+            research_outline = research_state.get("research_outline", [])
+            all_topics = research_state.get("all_topics", [])
+            outline_embedding = research_state.get("outline_embedding")
+            user_message = research_state.get("user_message", user_message)
+            
+            # Skip outline generation and go straight to research cycles
+            initial_results = []  # Will be regenerated in cycles
+        else:
+            research_state = state.get("research_state") if state else None
+            synthesis_outline = research_state.get("research_outline", []) if research_state else []
 
         if synthesis_outline:
             for topic_item in synthesis_outline:
@@ -8642,10 +8666,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Prepare the export data structure
         export_data = {
             "export_timestamp": export_timestamp,
-            "research_date": self.research_date,
-            "original_query": state.get("research_state", {}).get(
-                "user_message", "Unknown query"
-            ),
+            "original_query": state.get("research_state", {}).get("user_message", state.get("user_message", "Unknown query")),
             "results_count": len(results_history),
             "results": [],
         }
@@ -9450,7 +9471,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         user_message = messages[-1].get("content", "").strip()
         if not user_message:
             return ""
-
+        self.update_state("user_message", user_message)
         # Set research date
         from datetime import datetime
 
@@ -9560,7 +9581,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             )
 
         # Check if we have research state from previous feedback
-        research_state = state.get("research_state")
+        research_state = None
         if research_state:
             # Use the existing research state from feedback
             research_outline = research_state.get("research_outline", [])
@@ -9794,6 +9815,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 )
 
             else:
+                initial_results = []  # Ensure this is always defined
                 # Regular new query - generate initial search queries
                 await self.emit_status(
                     "info", "Generating initial search queries...", False
@@ -10069,7 +10091,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # Ensure consistent token counts
         await self.update_token_counts()
 
-        # Step 4: Begin research cycles
+        logger.info(f"🔍 Starting research cycles with {len(all_topics)} topics")
+        logger.info(f"🔍 Initial results count: {len(initial_results) if 'initial_results' in locals() else 'undefined'}")
+        await self.emit_status("info", f"Starting research with {len(all_topics)} topics", False)
         while cycle < max_cycles and active_outline:
             cycle += 1
             await self.emit_status(
