@@ -224,7 +224,7 @@ class ResearchStateManager:
                 "prev_comprehensive_summary": "",
                 "waiting_for_outline_feedback": False,
                 "outline_feedback_data": None,
-                "research_state": None,
+                "research_state": {"research_outline": []}, 
                 "follow_up_mode": False,
                 "user_preferences": {"pdv": None, "strength": 0.0, "impact": 0.0},
                 "research_dimensions": None,
@@ -665,8 +665,8 @@ class Pipe:
         return self.state_manager.get_state(self.conversation_id)
 
     def update_state(self, key, value):
-        """Update a specific state value"""
-        self.state_manager.update_state(self.conversation_id, key, value)
+        state = self.get_state()
+        state[key] = value
 
     def reset_state(self):
         """Reset the state for the current conversation"""
@@ -8115,6 +8115,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
         # Add the research outline for better context
         state = self.get_state()
+
         research_outline = state.get("research_state", {}).get("research_outline", [])
         if research_outline:
             smoothing_context += f"## Full Research Outline:\n"
@@ -9778,7 +9779,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
                 # Initialize research dimensions
                 await self.initialize_research_dimensions(all_topics, user_message)
-
+                print(state.get("research_dimensions"))
                 # Display the outline to the user
                 outline_text = "### Research Outline for Follow-up\n\n"
                 for topic in research_outline:
