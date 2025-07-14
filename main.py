@@ -56,6 +56,7 @@ class InteractiveResearchSession:
     async def run_research(self, query):
         """Run research with interactive feedback support"""
         print(f"\n🎯 Researching: {query}")
+        self.original_query = query  # ← Add this line  
         print("=" * 50)
         # FORCE CLEAN START - Add this section
         print("🧹 Ensuring clean start...")
@@ -158,10 +159,32 @@ class InteractiveResearchSession:
                 print("⚠️ Unexpected state - research may have encountered an issue")
                 print(f"   Debug info: waiting={waiting_for_feedback}, completed={research_completed}")
             
+
             # Step 5: Final status check
             final_state = self.pipe.get_state()
             final_completed = final_state.get("research_completed", False)
-            
+
+            # FIX EXPORT DATA - Add this section
+            if final_completed and hasattr(self, 'original_query'):
+                print("🔧 Fixing export data...")
+                
+                # Update the research state with correct query
+                research_state = final_state.get("research_state", {})
+                research_state["user_message"] = self.original_query
+                self.pipe.update_state("research_state", research_state)
+                
+                # Also ensure results_history has the correct query in results
+                results_history = final_state.get("results_history", [])
+                if results_history:
+                    for result in results_history:
+                        if not result.get("query") or result.get("query") == "continue":
+                            result["query"] = self.original_query
+                    self.pipe.update_state("results_history", results_history)
+                
+                print(f"   ✅ Fixed query: {self.original_query}")
+                print(f"   ✅ Fixed {len(results_history)} results")
+
+
             if final_completed:
                 print("\n" + "=" * 50)
                 print("🎉 Research completed successfully!")
