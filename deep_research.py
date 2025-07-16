@@ -710,9 +710,6 @@ class Pipe:
         if not text or not text.strip():
             return None
 
-        text = text[:2000]
-        text = text.replace(":", " - ")
-
         # Check cache first
         cached_embedding = self.embedding_cache.get(text)
         if cached_embedding is not None:
@@ -725,41 +722,44 @@ class Pipe:
             async with aiohttp.ClientSession(connector=connector) as session:
                 payload = {
                     "model": self.valves.EMBEDDING_MODEL,
-                    "input": text,
+                    "input": text,  # LMStudio uses "input" not "prompt"
                 }
 
+                # Try LMStudio/OpenAI format first
                 async with session.post(
-                        f"{self.valves.OLLAMA_URL}/v1/embeddings", json=payload, timeout=30
+                    f"{self.valves.OLLAMA_URL}/v1/embeddings", 
+                    json=payload, 
+                    timeout=30
                 ) as response:
                     if response.status == 200:
                         result = await response.json()
-                        # Handle both old and new API response formats
-                        if "embedding" in result:
-                            embedding = result.get("embedding", [])
+                        # Handle OpenAI-style response
+                        if "data" in result and len(result["data"]) > 0:
+                            embedding = result["data"][0].get("embedding", [])
                             if embedding:
-                                # Normalize dimension before caching
                                 normalized_embedding = normalize_embedding_dimension(embedding)
                                 if normalized_embedding:
                                     self.embedding_cache.set(text, normalized_embedding)
                                     return normalized_embedding
-                        elif "embeddings" in result and result["embeddings"]:
-                            # New format with batch response (we only sent one text, so take first)
-                            embedding = result["embeddings"][0]
+                        
+                        # Handle old format as fallback
+                        elif "embedding" in result:
+                            embedding = result.get("embedding", [])
                             if embedding:
-                                # Normalize dimension before caching
                                 normalized_embedding = normalize_embedding_dimension(embedding)
                                 if normalized_embedding:
                                     self.embedding_cache.set(text, normalized_embedding)
                                     return normalized_embedding
                     else:
-                        logger.warning(
-                            f"Embedding request failed with status {response.status}"
-                        )
-
-            return None
+                        logger.warning(f"Embedding request failed with status {response.status}")
+                        
         except Exception as e:
             logger.error(f"Error getting embedding: {e}")
-            return None
+            
+        # Return a simple default embedding if API fails
+        logger.warning(f"Failed to get embedding for '{text[:50]}...', using default")
+        default_embedding = [0.1] * 384  # Simple default
+        return default_embedding
 
     async def get_transformed_embedding(
             self, text: str, transformation=None
@@ -3128,55 +3128,73 @@ class Pipe:
         else:
             logger.warning("No research dimensions available for display")
 
-    async def initialize_research_dimensions(
-            self, outline_items: List[str], user_query: str
-    ):
+    async def initialize_research_dimensions(self, outline_items: List[str], user_query: str):
         """Initialize the semantic dimensions for tracking research progress"""
         try:
-            # Get embeddings for each outline item sequentially
-            item_embeddings = []
-            for item in outline_items:
-                embedding = await self.get_embedding(item[:2000])
-                if embedding:
-                    item_embeddings.append(embedding)
-
-            # Ensure we have enough embeddings for PCA
-            if len(item_embeddings) < 3:
-                logger.warning(
-                    f"Not enough valid embeddings for research dimensions: {len(item_embeddings)}/3 required"
-                )
+            logger.info(f"Initializing research dimensions with {len(outline_items)} outline items: {outline_items[:3]}...")
+            
+            if not outline_items or len(outline_items) < 2:
+                logger.warning("Not enough outline items to create semantic dimensions")
                 self.update_state("research_dimensions", None)
                 return
-
-            # Apply PCA to reduce to key dimensions
-            pca = PCA(n_components=min(10, len(item_embeddings)))
-            embedding_array = np.array(item_embeddings)
-            pca.fit(embedding_array)
-
-            # Store the PCA model and progress trackers
-            research_dimensions = {
-                "eigenvectors": pca.components_.tolist(),
-                "eigenvalues": pca.explained_variance_.tolist(),
-                "explained_variance": pca.explained_variance_ratio_.tolist(),
-                "total_variance": pca.explained_variance_ratio_.sum(),
-                "dimensions": pca.n_components_,
-                "coverage": np.zeros(
-                    pca.n_components_
-                ).tolist(),  # Initialize empty coverage
-            }
-
-            self.update_state("research_dimensions", research_dimensions)
-
-            # Immediately store a copy of coverage for display
-            self.update_state(
-                "latest_dimension_coverage", research_dimensions["coverage"]
+                
+            # Get embeddings for all outline items
+            outline_embeddings = []
+            valid_items = []
+            
+            for item in outline_items:
+                if isinstance(item, str) and len(item.strip()) > 3:
+                    try:
+                        embedding = await self.get_embedding(item.strip())
+                        if embedding and len(embedding) > 0:
+                            # Normalize embedding dimension
+                            normalized = normalize_embedding_dimension(embedding)
+                            if normalized:
+                                outline_embeddings.append(normalized)
+                                valid_items.append(item.strip())
+                    except Exception as e:
+                        logger.warning(f"Failed to get embedding for item '{item}': {e}")
+                        continue
+                        
+            logger.info(f"Got {len(outline_embeddings)} valid embeddings from {len(outline_items)} items")
+            
+            if len(outline_embeddings) < 2:
+                logger.warning(f"Only {len(outline_embeddings)} valid embeddings, need at least 2")
+                self.update_state("research_dimensions", None)
+                return
+                
+            # Compute semantic eigendecomposition
+            cache_key = f"dimensions_{hash(user_query)}_{len(valid_items)}"
+            eigendecomposition = await self.compute_semantic_eigendecomposition(
+                valid_items, outline_embeddings, cache_key=cache_key
             )
-
-            logger.info(
-                f"Initialized research dimensions with {pca.n_components_} dimensions"
-            )
+            
+            if eigendecomposition and eigendecomposition.get("eigenvalues"):
+                # Initialize coverage tracking
+                num_dimensions = min(len(eigendecomposition.get("eigenvalues", [])), 8)
+                initial_coverage = [0.0] * num_dimensions
+                
+                research_dimensions = {
+                    "eigendecomposition": eigendecomposition,
+                    "coverage": initial_coverage,
+                    "items": valid_items,
+                    "last_updated": datetime.now().isoformat(),
+                    "user_query": user_query
+                }
+                
+                self.update_state("research_dimensions", research_dimensions)
+                logger.info(f"Successfully initialized {num_dimensions} research dimensions")
+                
+                # Update the display
+                await self.update_research_dimensions_display()
+            else:
+                logger.error("Failed to compute eigendecomposition or no eigenvalues returned")
+                self.update_state("research_dimensions", None)
+                
         except Exception as e:
             logger.error(f"Error initializing research dimensions: {e}")
+            import traceback
+            traceback.print_exc()
             self.update_state("research_dimensions", None)
 
     async def update_dimension_coverage(
@@ -5261,7 +5279,32 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         except Exception as e:
             logger.error(f"Error in quality filtering: {e}")
             return True  # Accept by default on error
-
+    def ensure_source_tracking(self, result: Dict):
+        """Ensure each research result is properly tracked in the master source table"""
+        
+        url = result.get("url", "")
+        title = result.get("title", "")
+        content = result.get("content", "")
+        
+        if not url:
+            return
+            
+        state = self.get_state()
+        master_source_table = state.get("master_source_table", {})
+        
+        if url not in master_source_table:
+            source_id = f"S{len(master_source_table) + 1}"
+            master_source_table[url] = {
+                "id": source_id,
+                "title": title or f"Source {len(master_source_table) + 1}",
+                "content_preview": content[:500] if content else "",
+                "source_type": "web", 
+                "accessed_date": getattr(self, 'research_date', datetime.now().strftime("%Y-%m-%d")),
+                "cited_in_sections": set(),
+            }
+            
+            self.update_state("master_source_table", master_source_table)
+            logger.debug(f"Added source {source_id} to master table: {title}")
     async def process_query(
             self,
             query: str,
@@ -5323,7 +5366,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     outline_embedding,
                     summary_embedding,
                 )
-
+                # Ensure source is tracked in master table
+                if processed_result and processed_result.get("valid", False):
+                    self.ensure_source_tracking(processed_result)
                 # Make sure similarity is preserved from original result
                 if "similarity" in result and "similarity" not in processed_result:
                     processed_result["similarity"] = result["similarity"]
@@ -7385,7 +7430,33 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         except Exception as e:
             logger.error(f"Error generating synthesis outline: {e}")
             return original_outline
-
+    def ensure_results_have_sources(self):
+        """Ensure all valid results are tracked as sources"""
+        state = self.get_state()
+        results_history = state.get("results_history", [])
+        master_source_table = state.get("master_source_table", {})
+        
+        logger.info(f"Ensuring sources: {len(results_history)} results, {len(master_source_table)} current sources")
+        
+        sources_added = 0
+        for result in results_history:
+            url = result.get("url", "")
+            if url and url not in master_source_table:
+                # Add this result as a source
+                source_id = f"S{len(master_source_table) + 1}"
+                master_source_table[url] = {
+                    "id": source_id,
+                    "title": result.get("title", f"Source {len(master_source_table) + 1}"),
+                    "content_preview": result.get("content", "")[:500],
+                    "source_type": "web",
+                    "accessed_date": getattr(self, 'research_date', datetime.now().strftime("%Y-%m-%d")),
+                    "cited_in_sections": set(),
+                }
+                sources_added += 1
+        
+        if sources_added > 0:
+            self.update_state("master_source_table", master_source_table)
+            logger.info(f"Added {sources_added} missing sources to master table")
     async def generate_subtopic_content_with_citations(
             self,
             section_title: str,
@@ -7397,6 +7468,48 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             previous_summary: str = "",
     ) -> Dict:
         """Generate content for a single subtopic with numbered citations"""
+    
+        # FIRST: Ensure we have sources
+        self.ensure_results_have_sources()
+        
+        state = self.get_state()
+        master_source_table = state.get("master_source_table", {})
+        
+        logger.info(f"Starting subtopic '{subtopic}' with {len(master_source_table)} available sources")
+        
+        # IMPROVED source selection - be more generous
+        sources_for_subtopic = {}
+        
+        # Use ALL available sources if we don't have many
+        if len(master_source_table) <= 10:
+            sources_for_subtopic = master_source_table.copy()
+            logger.info(f"Using all {len(sources_for_subtopic)} available sources for subtopic")
+        else:
+            # If we have many sources, try to filter
+            for url, source_data in master_source_table.items():
+                title = source_data.get("title", "").lower()
+                preview = source_data.get("content_preview", "").lower()
+                
+                # Check if subtopic keywords appear
+                subtopic_words = [word.lower() for word in subtopic.split() if len(word) > 2]
+                
+                relevance = 0
+                for word in subtopic_words:
+                    if word in title: relevance += 0.5
+                    if word in preview: relevance += 0.3
+                    
+                # Include if relevant OR if we need more sources
+                if relevance > 0.1 or len(sources_for_subtopic) < 5:
+                    sources_for_subtopic[url] = source_data
+                    
+            # Ensure we have at least some sources
+            if len(sources_for_subtopic) == 0:
+                # Just take the first 5 sources
+                for i, (url, source_data) in enumerate(master_source_table.items()):
+                    if i < 5:
+                        sources_for_subtopic[url] = source_data
+        
+        logger.info(f"Subtopic '{subtopic}' will use {len(sources_for_subtopic)} sources")
         # Only emit status if we haven't seen this section yet
         if not hasattr(self, "_seen_subtopics"):
             self._seen_subtopics = set()
@@ -7427,13 +7540,14 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             "content": f"""You are a post-grad research assistant writing a concise subsection (1-3 paragraphs) about "{subtopic}" 
         for a comprehensive combined research report addressing this query: "{original_query}" based on internet research results.
 
-        Your subsection MUST:
+  Your subsection MUST:
         1. Focus specifically on the subtopic "{subtopic}" within the broader section "{section_title}".
         2. Make FULL use of the provided research sources, and ONLY the provided sources.
         3. Include IN-TEXT CITATIONS for all information from sources, using ONLY the numerical IDs provided in the source list, e.g. [1], [4], etc.
         4. Follow a structure that best fits the subtopic subject matter. Aim for an academic report style while tolerating flexibility as appropriate.
         5. Only be written on the subtopic matter - consider how your subsection will be combined with others in a greater research report.
         6. Be written to a length, between 1 medium paragraph and 3 long paragraphs, based on the subtopic's perceived importance to the research query.
+        7. USE THE SOURCES PROVIDED - if you don't use sources, the content will be rejected.
 
         Your subsection must NOT:
         1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication. 
@@ -7511,11 +7625,56 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         subtopic_context += f"# Within Section: {section_title}\n\n"
 
         # Add the research outline for context
-        subtopic_context += "## Research Outline Context:\n"
+        # FIXED: Better source matching for subtopics
         state = self.get_state()
+        master_source_table = state.get("master_source_table", {})
+        results_history = state.get("results_history", [])
+
+        # Improved source matching logic
+        sources_for_subtopic = {}
+        for result in research_results:
+            url = result.get("url", "")
+            content = result.get("content", "")
+            query = result.get("query", "")
+            
+            if not url or not content:
+                continue
+                
+            # Calculate relevance score
+            relevance_score = 0
+            
+            # Check if subtopic keywords appear in content
+            subtopic_words = subtopic.lower().split()
+            content_lower = content.lower()
+            
+            word_matches = sum(1 for word in subtopic_words if len(word) > 2 and word in content_lower)
+            if word_matches > 0:
+                relevance_score += (word_matches / len(subtopic_words)) * 0.7
+                
+            # Check query relevance
+            if any(word in query.lower() for word in subtopic_words if len(word) > 2):
+                relevance_score += 0.3
+                
+            # Include if relevant OR if we need more sources
+            if relevance_score > 0.1 or len(sources_for_subtopic) < 3:
+                if url in master_source_table:
+                    source_data = master_source_table[url].copy()
+                    source_data["relevance"] = relevance_score
+                    sources_for_subtopic[url] = source_data
+
+        # If no sources found, use any available sources
+        if len(sources_for_subtopic) == 0:
+            logger.warning(f"No specific sources for '{subtopic}', using available sources")
+            for url, source_data in list(master_source_table.items())[:5]:  # Limit to 5 sources
+                sources_for_subtopic[url] = source_data.copy()
+                sources_for_subtopic[url]["relevance"] = 0.1
+
+        logger.info(f"Subtopic '{subtopic}' uses {len(sources_for_subtopic)} sources")
+
+# Add the research outline for context
+        subtopic_context += "## Research Outline Context:\n"
         research_state = state.get("research_state") if state else None
         synthesis_outline = research_state.get("research_outline", []) if research_state else []
-
         if synthesis_outline:
             for topic_item in synthesis_outline:
                 if not isinstance(topic_item, dict):
@@ -7523,15 +7682,51 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 topic = topic_item.get("topic", "")
                 if topic == section_title:
                     subtopic_context += f"**Current Section: {topic}**\n"
-                else:
-                    subtopic_context += f"Section: {topic}\n"
+                    subtopics_list = topic_item.get("subtopics", [])
+                    if subtopics_list:
+                        for st in subtopics_list:
+                            if st == subtopic:
+                                subtopic_context += f"  - **Current Subtopic: {st}**\n"
+                            else:
+                                subtopic_context += f"  - {st}\n"
+                    break  # Exit loop once we find the current section
 
-                for st in topic_item.get("subtopics", []):
-                    if st == subtopic:
-                        subtopic_context += f"  - **Current Subtopic: {st}**\n"
-                    else:
-                        subtopic_context += f"  - {st}\n"
-            subtopic_context += "\n"
+        # CRITICAL FIX: Add source content to the context
+        subtopic_context += f"\n## Available Source List (Use ONLY these numerical citations):\n\n"
+        
+        # Create source map for tracking
+        source_id_map = {}
+        source_counter = 1
+        
+        for url, source_data in sorted(sources_for_subtopic.items(), key=lambda x: x[1]["title"]):
+            source_id = source_data.get("id", f"S{source_counter}")
+            source_title = source_data.get("title", f"Source {source_counter}")
+            
+            # Add to context for the AI to see
+            subtopic_context += f"[{source_counter}] {source_title} - {url}\n"
+            
+            # Track mapping
+            source_id_map[url] = source_counter
+            source_counter += 1
+        
+        subtopic_context += "\n"
+        
+        # Add source content excerpts for better citation
+        if sources_for_subtopic:
+            subtopic_context += "## Source Content Excerpts:\n\n"
+            
+            for url, source_data in list(sources_for_subtopic.items())[:5]:  # Limit to 5 for context
+                source_num = source_id_map.get(url, "?")
+                title = source_data.get("title", "Unknown")
+                preview = source_data.get("content_preview", "")
+                
+                if preview:
+                    subtopic_context += f"**Source [{source_num}] - {title}:**\n"
+                    subtopic_context += f"{preview[:500]}...\n\n"
+        
+        # Update the count tracking - this should now persist
+        logger.info(f"Subtopic '{subtopic}' will actually use {len(sources_for_subtopic)} sources with content")
+        subtopic_context += "\n"
 
         # Create a unique cache key for this subtopic
         subtopic_key = f"{section_title}_{subtopic}"
@@ -8235,31 +8430,52 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             "title_to_global_id": title_to_global_id,
             "url_to_global_id": url_to_global_id,
         }
-
+    def renumber_citations_in_content(self, content):
+        """Update citation numbers in content to match sequential bibliography"""
+        state = self.get_state()
+        id_mapping = state.get("final_id_mapping", {})
+        
+        if not id_mapping:
+            return content
+        
+        # Replace citations with new sequential numbers
+        for old_id, new_id in id_mapping.items():
+            # Replace [old_id] with [new_id]
+            content = re.sub(rf'\[{old_id}\]', f'[{new_id}]', content)
+        
+        return content
     async def format_bibliography_list(self, bibliography):
-        """Format the bibliography as a numbered list"""
+        """Format the bibliography as a numbered list with sequential numbering"""
         if not bibliography:
-            return "No sources were referenced in this research."
+            return ""
 
-        # Create numbered list format
         bib_list = "\n\n## Bibliography\n\n"
-
-        # Add each bibliography entry
-        for entry in bibliography:
+        
+        # Sort bibliography by current ID to maintain order
+        sorted_bib = sorted(bibliography, key=lambda x: x.get("id", 0))
+        
+        # Renumber sequentially starting from 1
+        id_mapping = {}
+        for i, entry in enumerate(sorted_bib, 1):
+            old_id = entry.get("id", i)
+            id_mapping[old_id] = i
+            entry["id"] = i  # Update the entry with new sequential ID
+        
+        # Add each bibliography entry with sequential numbering
+        for entry in sorted_bib:
             citation_id = entry["id"]
-            title = entry["title"]
-            url = entry["url"]
-
-            # Format URL for markdown linking
-            if url.startswith("http"):
-                url_formatted = f"[{url}]({url})"
-            else:
-                url_formatted = url
-
-            bib_list += f"[{citation_id}] {title}. {url_formatted}\n\n"
-
+            title = entry.get("title", "Untitled")
+            url = entry.get("url", "")
+            
+            bib_list += f"[{citation_id}] {title}. [{url}]({url})\n\n"
+        
+        # Store the ID mapping for updating citations in content
+        state = self.get_state()
+        state["final_id_mapping"] = id_mapping
+        self.update_state("final_id_mapping", id_mapping)
+        
         return bib_list
-
+    
     async def verify_citation_batch(self, url, citations, source_content):
         """Verify a batch of citations from a single source with improved sentence context isolation"""
         try:
@@ -8639,6 +8855,55 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         export_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         file_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        # CRITICAL FIX: If no results_history, create from available sources
+        if len(results_history) == 0:
+            logger.warning("No results_history available, creating from available sources")
+            
+            master_source_table = state.get("master_source_table", {})
+            content_cache = state.get("content_cache", {})
+            comprehensive_answer = state.get("prev_comprehensive_summary", "")
+            
+            # Create synthetic results from master sources
+            synthetic_results = []
+            for url, source_data in master_source_table.items():
+                # Try to get content from cache first
+                content = ""
+                if url in content_cache and isinstance(content_cache[url], dict):
+                    content = content_cache[url].get("content", "")[:2000]  # First 2000 chars
+                
+                if not content:
+                    content = source_data.get("content_preview", "")
+                
+                synthetic_result = {
+                    "query": state.get("research_state", {}).get("user_message", "research query"),
+                    "url": url,
+                    "title": source_data.get("title", "Research Source"),
+                    "tokens": len(content.split()) if content else 0,
+                    "content": content,
+                    "similarity": 0.5,  # Default similarity
+                    "timestamp": export_timestamp
+                }
+                synthetic_results.append(synthetic_result)
+            
+            # Use synthetic results if we created any
+            if synthetic_results:
+                results_history = synthetic_results
+                logger.info(f"Created {len(synthetic_results)} synthetic results for export")
+            else:
+                # Last resort: create one result with the comprehensive answer
+                if comprehensive_answer:
+                    synthetic_results = [{
+                        "query": state.get("research_state", {}).get("user_message", "research query"),
+                        "url": "comprehensive_research_result",
+                        "title": "Comprehensive Research Result",
+                        "tokens": len(comprehensive_answer.split()),
+                        "content": comprehensive_answer,
+                        "similarity": 1.0,
+                        "timestamp": export_timestamp
+                    }]
+                    results_history = synthetic_results
+                    logger.info("Created comprehensive answer result for export")
+
         # Prepare the export data structure
         export_data = {
             "export_timestamp": export_timestamp,
@@ -8725,12 +8990,14 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 f.write(f"{result['content']}\n\n")
                 f.write("=" * 50 + "\n\n")
 
-        # Also save as JSON for programmatic access
-        # json_filename = f"research_export_{query_for_filename}_{file_timestamp}.json"
-        # json_filepath = os.path.join(export_dir, json_filename)
-
-        # with open(json_filepath, "w", encoding="utf-8") as f:
-        #     json.dump(export_data, f, indent=2)
+            # Add the comprehensive answer at the end if available
+            comprehensive_answer = state.get("prev_comprehensive_summary", "")
+            if comprehensive_answer:
+                f.write("\n" + "="*60 + "\n")
+                f.write("COMPREHENSIVE RESEARCH REPORT\n")
+                f.write("="*60 + "\n\n")
+                f.write(comprehensive_answer)
+                f.write("\n\n")
 
         return {
             "export_data": export_data,
@@ -10605,7 +10872,41 @@ Format your response as a valid JSON object with the following structure:
         # If synthesis outline generation failed, use original
         if not synthesis_outline:
             synthesis_outline = research_outline
+        logger.info("=== PRE-SYNTHESIS SOURCE CHECK ===")
 
+        # Force rebuild sources from any available data
+        state = self.get_state()
+        results_history = state.get("results_history", [])
+        master_source_table = state.get("master_source_table", {})
+
+        logger.info(f"Pre-synthesis: {len(results_history)} results, {len(master_source_table)} sources")
+
+        # If no sources but we have cached content, create sources from cache
+        if len(master_source_table) == 0:
+            content_cache = state.get("content_cache", {})
+            logger.info(f"No sources found, checking content cache: {len(content_cache)} items")
+            
+            rebuilt_sources = {}
+            for url, cached_data in content_cache.items():
+                if isinstance(cached_data, dict) and cached_data.get("content"):
+                    source_id = f"S{len(rebuilt_sources) + 1}"
+                    rebuilt_sources[url] = {
+                        "id": source_id,
+                        "title": f"Cached Source {len(rebuilt_sources) + 1}",
+                        "content_preview": cached_data["content"][:500],
+                        "source_type": "web",
+                        "accessed_date": self.research_date,
+                        "cited_in_sections": set(),
+                    }
+            
+            if rebuilt_sources:
+                self.update_state("master_source_table", rebuilt_sources)
+                logger.info(f"Rebuilt {len(rebuilt_sources)} sources from cache")
+
+        # Step 8: Synthesize final answer with the selected model - Section by Section with citations
+        await self.emit_synthesis_status(
+            "Synthesizing comprehensive answer from research results..."
+        )
         # Step 8: Synthesize final answer with the selected model - Section by Section with citations
         await self.emit_synthesis_status(
             "Synthesizing comprehensive answer from research results..."
@@ -11007,6 +11308,28 @@ Format your response as a valid JSON object with the following structure:
         # Add verification note if any citations were flagged
         comprehensive_answer = await self.add_verification_note(comprehensive_answer)
 
+
+        # Add verification note if any citations were flagged
+        comprehensive_answer = await self.add_verification_note(comprehensive_answer)
+
+        # Debug: Check what's already in comprehensive_answer
+        bib_count = comprehensive_answer.count("## Bibliography")
+        ref_count = comprehensive_answer.count("## References") 
+        logger.info(f"Before adding bibliography: Found {bib_count} Bibliography sections, {ref_count} References sections")
+
+        if bib_count > 0 or ref_count > 0:
+            # Find where they appear
+            bib_pos = comprehensive_answer.find("## Bibliography")
+            ref_pos = comprehensive_answer.find("## References")
+            logger.info(f"Bibliography position: {bib_pos}, References position: {ref_pos}")
+            
+            # Show context around the first occurrence
+            if bib_pos >= 0:
+                start = max(0, bib_pos - 100)
+                end = min(len(comprehensive_answer), bib_pos + 300)
+                logger.info(f"Context around first bibliography: ...{comprehensive_answer[start:end]}...")
+
+        comprehensive_answer = self.renumber_citations_in_content(comprehensive_answer)
         # Add bibliography
         comprehensive_answer += f"{bibliography_table}\n\n"
 

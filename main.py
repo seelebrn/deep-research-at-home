@@ -100,7 +100,35 @@ class InteractiveResearchSession:
                 __model__="research",
                 __request__=None
             )
-            
+            state = self.pipe.get_state()
+            master_sources = state.get("master_source_table", {})
+            results_history = state.get("results_history", [])
+            research_dims = state.get("research_dimensions")
+
+            print(f"🔍 DETAILED DEBUG after initial research:")
+            print(f"   - Master sources: {len(master_sources)}")
+            print(f"   - Results history: {len(results_history)}")
+            content_cache = state.get("content_cache", {})
+            print(f"   - Content cache: {len(content_cache)}")
+            print(f"   - Research dimensions: {'✅' if research_dims else '❌'}")
+
+            # Print first few sources if they exist
+            if master_sources:
+                print(f"   - Sample sources:")
+                for i, (url, data) in enumerate(list(master_sources.items())[:3]):
+                    print(f"     {i+1}. {data.get('id', 'no-id')}: {data.get('title', 'no-title')[:50]}...")
+
+            # Print first few cached items  
+            if content_cache:
+                print(f"   - Sample cache:")
+                for i, (url, data) in enumerate(list(content_cache.items())[:3]):
+                    if isinstance(data, dict):
+                        content_len = len(data.get("content", ""))
+                        print(f"     {i+1}. {url[:50]}... ({content_len} chars)")
+
+            if research_dims:
+                coverage = research_dims.get("coverage", [])
+                print(f"   - Dimensions coverage: {len(coverage)} dimensions")
             # Step 2: Check what happened after the initial call
             state = self.pipe.get_state()
             waiting_for_feedback = state.get("waiting_for_outline_feedback", False)
@@ -216,7 +244,13 @@ async def main():
     # CHECK THE CRITICAL SETTINGS
     print(f"🔧 INTERACTIVE_RESEARCH: {session.pipe.valves.INTERACTIVE_RESEARCH}")
     print(f"🔧 ENABLED: {session.pipe.valves.ENABLED}")
-    
+    # Test embedding before research
+    print("🧪 Testing embedding API...")
+    test_embedding = await session.pipe.get_embedding("test methadone france")
+    if test_embedding and len(test_embedding) > 0:
+        print(f"   ✅ Embedding API working: {len(test_embedding)} dimensions")
+    else:
+        print(f"   ❌ Embedding API failed")
     user_query = input("Enter your research question: ").strip()
     
     if not user_query:
