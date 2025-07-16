@@ -7457,6 +7457,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         if sources_added > 0:
             self.update_state("master_source_table", master_source_table)
             logger.info(f"Added {sources_added} missing sources to master table")
+
     async def generate_subtopic_content_with_citations(
             self,
             section_title: str,
@@ -7467,8 +7468,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             is_follow_up: bool = False,
             previous_summary: str = "",
     ) -> Dict:
-        """Generate content for a single subtopic with numbered citations"""
-    
+        """Generate content for a single subtopic with numbered citations - FIXED VERSION"""
+
         # FIRST: Ensure we have sources
         self.ensure_results_have_sources()
         
@@ -7477,464 +7478,173 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         
         logger.info(f"Starting subtopic '{subtopic}' with {len(master_source_table)} available sources")
         
-        # IMPROVED source selection - be more generous
-        sources_for_subtopic = {}
-        
-        # Use ALL available sources if we don't have many
-        if len(master_source_table) <= 10:
-            sources_for_subtopic = master_source_table.copy()
-            logger.info(f"Using all {len(sources_for_subtopic)} available sources for subtopic")
-        else:
-            # If we have many sources, try to filter
-            for url, source_data in master_source_table.items():
-                title = source_data.get("title", "").lower()
-                preview = source_data.get("content_preview", "").lower()
-                
-                # Check if subtopic keywords appear
-                subtopic_words = [word.lower() for word in subtopic.split() if len(word) > 2]
-                
-                relevance = 0
-                for word in subtopic_words:
-                    if word in title: relevance += 0.5
-                    if word in preview: relevance += 0.3
-                    
-                # Include if relevant OR if we need more sources
-                if relevance > 0.1 or len(sources_for_subtopic) < 5:
-                    sources_for_subtopic[url] = source_data
-                    
-            # Ensure we have at least some sources
-            if len(sources_for_subtopic) == 0:
-                # Just take the first 5 sources
-                for i, (url, source_data) in enumerate(master_source_table.items()):
-                    if i < 5:
-                        sources_for_subtopic[url] = source_data
-        
-        logger.info(f"Subtopic '{subtopic}' will use {len(sources_for_subtopic)} sources")
-        # Only emit status if we haven't seen this section yet
+        # Status tracking
         if not hasattr(self, "_seen_subtopics"):
             self._seen_subtopics = set()
 
-        # Only emit status if we haven't seen this subtopic yet
         if subtopic not in self._seen_subtopics:
-            await self.emit_status(
-                "info", f"Generating content for subtopic: {subtopic}...", False
-            )
+            await self.emit_status("info", f"Generating content for subtopic: {subtopic}...", False)
             self._seen_subtopics.add(subtopic)
 
-        # Get state
-        state = self.get_state()
+        # =================================================================
+        # SOURCE SELECTION - SIMPLIFIED AND RELIABLE
+        # =================================================================
+        
+        sources_for_subtopic = {}
+        
+        # Take up to 10 best sources for this subtopic
+        source_counter = 1
+        for url, source_data in list(master_source_table.items())[:10]:
+            sources_for_subtopic[url] = {
+                "local_id": source_counter,  # Simple sequential numbering
+                "title": source_data.get("title", f"Source {source_counter}"),
+                "url": url,
+                "content_preview": source_data.get("content_preview", ""),
+                "subtopic": subtopic,
+                "section": section_title,
+            }
+            source_counter += 1
 
-        # Get relevance cache or initialize it
-        relevance_cache = state.get("subtopic_relevance_cache", {})
+        logger.info(f"Subtopic '{subtopic}' will use {len(sources_for_subtopic)} sources")
 
-        # Create embedding cache keys for efficiency
-        query_embedding_key = f"query_embedding_{hash(original_query)}"
-        subtopic_embedding_key = f"subtopic_embedding_{hash(subtopic)}"
-        combined_embedding_key = (
-            f"combined_embedding_{hash(original_query)}_{hash(subtopic)}"
-        )
+        # =================================================================
+        # LENGTH GUIDANCE
+        # =================================================================
+        
+        if len(sources_for_subtopic) >= 8:
+            length_guidance = "8-12 paragraphs with comprehensive analysis using ALL available sources"
+        elif len(sources_for_subtopic) >= 5:
+            length_guidance = "6-8 paragraphs with detailed coverage using ALL provided sources"
+        elif len(sources_for_subtopic) >= 3:
+            length_guidance = "4-6 paragraphs using ALL provided sources"
+        else:
+            length_guidance = "3-4 paragraphs covering available information"
 
-        # Create a prompt specific to this subtopic
+        # =================================================================
+        # CREATE SUBTOPIC PROMPT
+        # =================================================================
+        
         subtopic_prompt = {
             "role": "system",
-            "content": f"""You are a post-grad research assistant writing a concise subsection (1-3 paragraphs) about "{subtopic}" 
-        for a comprehensive combined research report addressing this query: "{original_query}" based on internet research results.
+            "content": f"""You are a post-grad research assistant writing a nuanced subsection about "{subtopic}". The length of the subsection should be {length_guidance} based on the {len(sources_for_subtopic)} sources available.
+            
+        This is for a comprehensive combined research report addressing this query: "{original_query}" based on internet research results.
 
-  Your subsection MUST:
-        1. Focus specifically on the subtopic "{subtopic}" within the broader section "{section_title}".
-        2. Make FULL use of the provided research sources, and ONLY the provided sources.
-        3. Include IN-TEXT CITATIONS for all information from sources, using ONLY the numerical IDs provided in the source list, e.g. [1], [4], etc.
-        4. Follow a structure that best fits the subtopic subject matter. Aim for an academic report style while tolerating flexibility as appropriate.
-        5. Only be written on the subtopic matter - consider how your subsection will be combined with others in a greater research report.
-        6. Be written to a length, between 1 medium paragraph and 3 long paragraphs, based on the subtopic's perceived importance to the research query.
-        7. USE THE SOURCES PROVIDED - if you don't use sources, the content will be rejected.
-
-        Your subsection must NOT:
-        1. Interpret the content in a lofty way that exaggerates its importance or profundity, or contrives a narrative with empty sophistication. 
-        2. Attempt to portray the subject matter in any particular sort of light, good or bad, especially by using apologetic or dismissive language.
-        3. Focus on perceived complexities or challenges related to the topic or research process, or include appeals to future research.
-        4. Ever take a preachy or moralizing tone, or take a "stance" for or against/"side" with or against anything not driven by the provided data.
-        5. Overstate the significance of specific services, providers, locations, brands, or other entities beyond examples of some type or category.
-        6. Sound to the reader as though it is overtly attempting to be diplomatic, considerate, enthusiastic, or overly-generalized.
+        Your subsection MUST:
+            1. Focus specifically on the subtopic "{subtopic}" within the broader section "{section_title}".
+            2. Make FULL use of the provided research sources, and ONLY the provided sources.
+            3. Include IN-TEXT CITATIONS for all information from sources, using ONLY the numerical IDs provided in the source list, e.g. [1], [4], etc.
+            4. With {len(sources_for_subtopic)} sources available, provide comprehensive coverage using ALL relevant sources.
+            5. USE THE SOURCES PROVIDED - if you don't use sources, the content will be rejected.
+            6. CITE EXTENSIVELY - aim to use most or all of the provided sources with proper citations.
 
         You must accurately cite your sources to avoid plagiarizing. Citations MUST be numerical and correspond to the correct source ID in the provided list.
-        Do not combine multiple IDs in one citation tag. Please respond with just the subsection body, no intro or title.""",
+        Please respond with just the subsection body, no intro or title.""",
         }
 
-        # Create a combined embedding for query + subtopic with state-level caching
-        combined_embedding = state.get(combined_embedding_key)
-
-        if combined_embedding is None:
-            # Check if we already have the individual embeddings cached in state
-            query_embedding = state.get(query_embedding_key)
-            subtopic_embedding = state.get(subtopic_embedding_key)
-
-            # Get query embedding if not already cached
-            if query_embedding is None:
-                try:
-                    query_embedding = await self.get_embedding(original_query)
-                    if query_embedding:
-                        # Cache at state level to avoid repeated API calls
-                        self.update_state(query_embedding_key, query_embedding)
-                except Exception as e:
-                    logger.error(f"Error getting query embedding: {e}")
-
-            # Get subtopic embedding if not already cached
-            if subtopic_embedding is None:
-                try:
-                    subtopic_embedding = await self.get_embedding(subtopic)
-                    if subtopic_embedding:
-                        # Cache at state level to avoid repeated API calls
-                        self.update_state(subtopic_embedding_key, subtopic_embedding)
-                except Exception as e:
-                    logger.error(f"Error getting subtopic embedding: {e}")
-
-            # Create combined embedding if both components exist
-            if query_embedding and subtopic_embedding:
-                try:
-                    # Combine with equal weight
-                    combined_array = (
-                            np.array(query_embedding) * 0.5
-                            + np.array(subtopic_embedding) * 0.5
-                    )
-                    # Normalize
-                    norm = np.linalg.norm(combined_array)
-                    if norm > 1e-10:
-                        combined_array = combined_array / norm
-                    combined_embedding = combined_array.tolist()
-                    # Cache the combined embedding
-                    self.update_state(combined_embedding_key, combined_embedding)
-                except Exception as e:
-                    logger.error(f"Error creating combined embedding: {e}")
-
-        # If combined embedding failed or doesn't exist, fall back to subtopic embedding
-        if not combined_embedding:
-            # Check if we have cached subtopic embedding
-            subtopic_embedding = state.get(subtopic_embedding_key)
-            if not subtopic_embedding:
-                # Try to get it now
-                subtopic_embedding = await self.get_embedding(subtopic)
-                # Cache if successful
-                if subtopic_embedding:
-                    self.update_state(subtopic_embedding_key, subtopic_embedding)
-
-            combined_embedding = subtopic_embedding
-
-        # Build context from research results that might be relevant to this subtopic
+        # =================================================================
+        # BUILD CONTEXT WITH SOURCES
+        # =================================================================
+        
         subtopic_context = f"# Subtopic to Write: {subtopic}\n"
         subtopic_context += f"# Within Section: {section_title}\n\n"
 
-        # Add the research outline for context
-        # FIXED: Better source matching for subtopics
-        state = self.get_state()
-        master_source_table = state.get("master_source_table", {})
-        results_history = state.get("results_history", [])
-
-        # Improved source matching logic
-        sources_for_subtopic = {}
-        for result in research_results:
-            url = result.get("url", "")
-            content = result.get("content", "")
-            query = result.get("query", "")
-            
-            if not url or not content:
-                continue
-                
-            # Calculate relevance score
-            relevance_score = 0
-            
-            # Check if subtopic keywords appear in content
-            subtopic_words = subtopic.lower().split()
-            content_lower = content.lower()
-            
-            word_matches = sum(1 for word in subtopic_words if len(word) > 2 and word in content_lower)
-            if word_matches > 0:
-                relevance_score += (word_matches / len(subtopic_words)) * 0.7
-                
-            # Check query relevance
-            if any(word in query.lower() for word in subtopic_words if len(word) > 2):
-                relevance_score += 0.3
-                
-            # Include if relevant OR if we need more sources
-            if relevance_score > 0.1 or len(sources_for_subtopic) < 3:
-                if url in master_source_table:
-                    source_data = master_source_table[url].copy()
-                    source_data["relevance"] = relevance_score
-                    sources_for_subtopic[url] = source_data
-
-        # If no sources found, use any available sources
-        if len(sources_for_subtopic) == 0:
-            logger.warning(f"No specific sources for '{subtopic}', using available sources")
-            for url, source_data in list(master_source_table.items())[:5]:  # Limit to 5 sources
-                sources_for_subtopic[url] = source_data.copy()
-                sources_for_subtopic[url]["relevance"] = 0.1
-
-        logger.info(f"Subtopic '{subtopic}' uses {len(sources_for_subtopic)} sources")
-
-# Add the research outline for context
-        subtopic_context += "## Research Outline Context:\n"
-        research_state = state.get("research_state") if state else None
-        synthesis_outline = research_state.get("research_outline", []) if research_state else []
-        if synthesis_outline:
-            for topic_item in synthesis_outline:
-                if not isinstance(topic_item, dict):
-                    continue
-                topic = topic_item.get("topic", "")
-                if topic == section_title:
-                    subtopic_context += f"**Current Section: {topic}**\n"
-                    subtopics_list = topic_item.get("subtopics", [])
-                    if subtopics_list:
-                        for st in subtopics_list:
-                            if st == subtopic:
-                                subtopic_context += f"  - **Current Subtopic: {st}**\n"
-                            else:
-                                subtopic_context += f"  - {st}\n"
-                    break  # Exit loop once we find the current section
-
-        # CRITICAL FIX: Add source content to the context
-        subtopic_context += f"\n## Available Source List (Use ONLY these numerical citations):\n\n"
+        # Add source list to context
+        subtopic_context += f"## Available Source List (Use ONLY these numerical citations):\n\n"
         
-        # Create source map for tracking
-        source_id_map = {}
-        source_counter = 1
-        
-        for url, source_data in sorted(sources_for_subtopic.items(), key=lambda x: x[1]["title"]):
-            source_id = source_data.get("id", f"S{source_counter}")
-            source_title = source_data.get("title", f"Source {source_counter}")
-            
-            # Add to context for the AI to see
-            subtopic_context += f"[{source_counter}] {source_title} - {url}\n"
-            
-            # Track mapping
-            source_id_map[url] = source_counter
-            source_counter += 1
+        for url, source_data in sources_for_subtopic.items():
+            local_id = source_data["local_id"]
+            title = source_data["title"]
+            subtopic_context += f"[{local_id}] {title} - {url}\n"
         
         subtopic_context += "\n"
         
-        # Add source content excerpts for better citation
-        if sources_for_subtopic:
-            subtopic_context += "## Source Content Excerpts:\n\n"
-            
-            for url, source_data in list(sources_for_subtopic.items())[:5]:  # Limit to 5 for context
-                source_num = source_id_map.get(url, "?")
-                title = source_data.get("title", "Unknown")
-                preview = source_data.get("content_preview", "")
-                
-                if preview:
-                    subtopic_context += f"**Source [{source_num}] - {title}:**\n"
-                    subtopic_context += f"{preview[:500]}...\n\n"
+        # Add source content excerpts
+        subtopic_context += "## Source Content Excerpts:\n\n"
         
-        # Update the count tracking - this should now persist
-        logger.info(f"Subtopic '{subtopic}' will actually use {len(sources_for_subtopic)} sources with content")
-        subtopic_context += "\n"
+        content_cache = state.get("content_cache", {})
+        
+        for url, source_data in sources_for_subtopic.items():
+            local_id = source_data["local_id"]
+            title = source_data["title"]
+            
+            # Get content excerpt
+            content_excerpt = ""
+            if url in content_cache and isinstance(content_cache[url], dict):
+                cached_content = content_cache[url].get("content", "")
+                if cached_content:
+                    content_excerpt = cached_content[:1500]
+            
+            if not content_excerpt:
+                content_excerpt = source_data.get("content_preview", "")[:800]
+            
+            if content_excerpt:
+                subtopic_context += f"**Source [{local_id}] - {title}:**\n"
+                subtopic_context += f"{content_excerpt}...\n\n"
 
-        # Create a unique cache key for this subtopic
-        subtopic_key = f"{section_title}_{subtopic}"
+        # Final instruction
+        subtopic_context += f"""Using the provided research sources and referencing them with numerical citations [#], write a comprehensive subsection about "{subtopic}" per the system prompt."""
 
-        # Calculate relevance scores for each result
-        subtopic_results = []
-        result_scores = []
-
-        # Check if we have cached relevance scores for this subtopic
-        if subtopic_key in relevance_cache:
-            logger.info(f"Using cached relevance scores for subtopic: {subtopic}")
-            result_scores = relevance_cache[subtopic_key]
-            # Sort by relevance score (highest first)
-            result_scores.sort(key=lambda x: x[1], reverse=True)
-            # Map back to research results
-            subtopic_results = [
-                research_results[i]
-                for i, _ in result_scores
-                if i < len(research_results)
-            ]
-        elif combined_embedding:
-            # Calculate relevance scores using combined query+subtopic embedding
-            for i, result in enumerate(research_results):
-                content = result.get("content", "")
-                if not content:
-                    continue
-
-                # Create a cache key for this result's embedding
-                result_key = f"result_{hash(result.get('url', ''))}"
-                content_embedding = state.get(result_key)
-
-                if not content_embedding:
-                    content_embedding = await self.get_embedding(content[:2000])
-                    # Cache the content embedding if valid
-                    if content_embedding:
-                        self.update_state(result_key, content_embedding)
-
-                if content_embedding:
-                    similarity = cosine_similarity(
-                        [content_embedding], [combined_embedding]
-                    )[0][0]
-                    result_scores.append((i, similarity))
-
-            # Cache the relevance scores for this subtopic
-            relevance_cache[subtopic_key] = result_scores
-            self.update_state("subtopic_relevance_cache", relevance_cache)
-
-            # Sort by relevance score (highest first)
-            result_scores.sort(key=lambda x: x[1], reverse=True)
-            # Map to research results
-            subtopic_results = [research_results[i] for i, _ in result_scores]
-        else:
-            # If no embedding, just use all results
-            subtopic_results = research_results
-
-        # Calculate how many results to include based on number of cycles and vibes
-        top_results_count = max(
-            3, min(len(subtopic_results), math.ceil(0.5 * self.valves.MAX_CYCLES + 3))
-        )
-        top_results = subtopic_results[:top_results_count]
-
-        # Create source list with assigned IDs
-        sources_for_subtopic = {}
-        source_id = 1
-
-        # Extract URLs and titles from top results, sort alphabetically by title
-        sorted_results = sorted(top_results, key=lambda x: x.get("title", "").lower())
-
-        for result in sorted_results:
-            url = result.get("url", "")
-            title = result.get("title", "Untitled Source")
-
-            if url and url not in sources_for_subtopic:
-                sources_for_subtopic[url] = {
-                    "id": source_id,
-                    "title": title,
-                    "url": url,
-                    "subtopic": subtopic,
-                    "section": section_title,
-                }
-                source_id += 1
-
-        # Add source list to context (at the beginning)
-        subtopic_context += (
-            "## Available Source List (Use ONLY these numerical citations):\n\n"
-        )
-        for url, source_data in sorted(
-                sources_for_subtopic.items(), key=lambda x: x[1]["title"]
-        ):
-            subtopic_context += (
-                f"[{source_data['id']}] {source_data['title']} - {url}\n"
-            )
-
-        subtopic_context += "\n## Research Results:\n\n"
-
-        # Reorder results to have most relevant last (most recent in context)
-        top_results.reverse()
-
-        # Add the top results to context (most relevant last)
-        for result in top_results:
-            url = result.get("url", "")
-            title = result.get("title", "Untitled Source")
-            content = result.get("content", "")
-
-            # Skip results without content
-            if not content:
-                continue
-
-            # Get the source ID for this URL
-            source_id = sources_for_subtopic.get(url, {}).get("id", "?")
-
-            subtopic_context += f"Source ID: [{source_id}] {title}\n"
-            subtopic_context += f"Content: {content}\n\n"
-
-        # Include previous summary if this is a follow-up
-        if is_follow_up and previous_summary:
-            subtopic_context += "## Previous Research Summary:\n\n"
-            subtopic_context += f"{previous_summary}...\n\n"
-
-        # Prepare final instruction
-        subtopic_context += f"""Using the provided research sources and referencing them with numerical citations [#], write a concise subsection about "{subtopic}" per the system prompt."""
-        subtopic_context += f"""Every citation MUST be numerical (e.g., [1], [2]) corresponding to the source list provided."""
-        subtopic_context += f"""Please use proper Markdown and write 1-3 focused paragraphs exclusively on this specific subtopic."""
-
-        # Create messages array for completion
+        # =================================================================
+        # GENERATE CONTENT
+        # =================================================================
+        
         messages = [subtopic_prompt, {"role": "user", "content": subtopic_context}]
 
-        # Generate subtopic content
         try:
-            # Calculate scaled temperature from the synthesis temperature valve
-            scaled_temperature = (
-                self.valves.TEMPERATURE
-            )  # Use research model temperature for subtopics
-
-            # Use research model for generating subtopics
             response = await self.generate_completion(
                 synthesis_model,
                 messages,
                 stream=False,
-                temperature=scaled_temperature,
+                temperature=self.valves.TEMPERATURE,
             )
 
             if response and "choices" in response and len(response["choices"]) > 0:
                 subtopic_content = response["choices"][0]["message"]["content"]
+                
+                # DEBUG: Check what citations are in the generated content
+                import re
+                citations_in_content = re.findall(r'\[(\d+)\]', subtopic_content)
+                logger.info(f"CITATIONS DEBUG - Subtopic '{subtopic}' generated citations: {citations_in_content}")
 
-                # Count tokens in the subtopic content
                 tokens = await self.count_tokens(subtopic_content)
 
-                # Store content for later use
-                subtopic_synthesized_content = state.get(
-                    "subtopic_synthesized_content", {}
-                )
-                subtopic_synthesized_content[subtopic] = subtopic_content
-                self.update_state(
-                    "subtopic_synthesized_content", subtopic_synthesized_content
-                )
+                # Extract actual citations used in content
+                used_citations = []
+                for citation_id in citations_in_content:
+                    try:
+                        citation_num = int(citation_id)
+                        # Find the source with this local ID
+                        for url, source_data in sources_for_subtopic.items():
+                            if source_data["local_id"] == citation_num:
+                                used_citations.append({
+                                    "local_id": citation_num,
+                                    "url": url,
+                                    "title": source_data["title"],
+                                    "subtopic": subtopic,
+                                    "section": section_title,
+                                })
+                                break
+                    except ValueError:
+                        continue
 
-                # Store source mapping for this subtopic
-                subtopic_sources = state.get("subtopic_sources", {})
-                subtopic_sources[subtopic] = sources_for_subtopic
-                self.update_state("subtopic_sources", subtopic_sources)
-
-                # Identify citations in this subtopic content
-                subtopic_citations = []
-                for url, source_data in sources_for_subtopic.items():
-                    local_id = source_data.get("id")
-                    if local_id is not None:
-                        # Find all instances of this citation in the text
-                        pattern = (
-                                r"([^.!?]*(?:\["
-                                + str(local_id)
-                                + r"\]|&#"
-                                + str(local_id)
-                                + r")[^.!?]*[.!?])"
-                        )
-                        context_matches = re.findall(pattern, subtopic_content)
-
-                        for match in context_matches:
-                            citation = {
-                                "marker": str(local_id),
-                                "raw_text": f"[{local_id}]",
-                                "text": match,
-                                "url": url,
-                                "section": section_title,
-                                "subtopic": subtopic,
-                                "suggested_title": source_data.get("title", ""),
-                            }
-                            subtopic_citations.append(citation)
-
-                # Log the sources used
-                logger.info(
-                    f"Subtopic '{subtopic}' uses {len(sources_for_subtopic)} sources"
-                )
+                logger.info(f"Subtopic '{subtopic}' actually used {len(used_citations)} citations")
 
                 return {
-                    "content": subtopic_content,  # Return original content with local IDs
+                    "content": subtopic_content,
                     "tokens": tokens,
                     "sources": sources_for_subtopic,
-                    "citations": subtopic_citations,
-                    "verified_citations": [],  # Verification happens later
-                    "flagged_citations": [],  # Flagging happens later
+                    "used_citations": used_citations,  # NEW: Track actually used citations
+                    "verified_citations": [],
+                    "flagged_citations": [],
                 }
             else:
+                logger.error(f"Failed to generate content for subtopic: {subtopic}")
                 return {
                     "content": f"*Error generating content for subtopic: {subtopic}*",
                     "tokens": 0,
                     "sources": {},
-                    "citations": [],
+                    "used_citations": [],
                     "verified_citations": [],
                     "flagged_citations": [],
                 }
@@ -7945,11 +7655,18 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 "content": f"*Error generating content for subtopic: {subtopic}*",
                 "tokens": 0,
                 "sources": {},
-                "citations": [],
+                "used_citations": [],
                 "verified_citations": [],
                 "flagged_citations": [],
             }
-
+    def safe_citation_replacement(self, content, replacement_map):
+        replacements = sorted(
+            [(f"[{old}]", f"[{new}]") for old, new in replacement_map.items()],
+            key=lambda x: -len(x[0])
+        )
+        for old, new in replacements:
+            content = re.sub(fr'(?<!\w){re.escape(old)}(?!\w)', new, content)
+        return content
     async def generate_section_content_with_citations(
             self,
             section_title: str,
@@ -7960,311 +7677,122 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             is_follow_up: bool = False,
             previous_summary: str = "",
     ) -> Dict:
-        """Generate content for a section by combining subtopics with citations"""
-        # Use a static set to track which sections we've displayed status for
+        """Final fixed version with robust citation handling"""
+        
+        # Status tracking
         if not hasattr(self, "_seen_sections"):
             self._seen_sections = set()
 
-        # Only emit status if we haven't seen this section yet
         if section_title not in self._seen_sections:
-            await self.emit_status(
-                "info", f"Generating content for section: {section_title}...", False
-            )
+            await self.emit_status("info", f"Generating content for section: {section_title}...", False)
             self._seen_sections.add(section_title)
 
-        # Get state
-        state = self.get_state()
-
-        # Generate content for each subtopic independently
+        # Generate all subtopics
         subtopic_contents = {}
-        section_sources = {}
-        all_section_citations = []
+        all_used_citations = []
         total_tokens = 0
 
         for subtopic in subtopics:
             subtopic_result = await self.generate_subtopic_content_with_citations(
-                section_title,
-                subtopic,
-                original_query,
-                research_results,
-                synthesis_model,
-                is_follow_up,
-                previous_summary if is_follow_up else "",
+                section_title, subtopic, original_query, 
+                research_results, synthesis_model, is_follow_up,
+                previous_summary if is_follow_up else ""
             )
-
+            
             subtopic_contents[subtopic] = subtopic_result["content"]
             total_tokens += subtopic_result.get("tokens", 0)
+            all_used_citations.extend(subtopic_result.get("used_citations", []))
 
-            # Collect all citations from this subtopic
-            if "citations" in subtopic_result:
-                all_section_citations.extend(subtopic_result["citations"])
-
-            # Merge sources with section sources, maintaining unique source IDs and tracking originals
-            for url, source_data in subtopic_result["sources"].items():
-                if url not in section_sources:
-                    section_sources[url] = (
-                        source_data.copy()
-                    )  # Use copy to avoid reference issues
-
-                # Store the original local ID with subtopic context for precise replacement
-                # Add this information to the source data record
-                if "original_ids" not in section_sources[url]:
-                    section_sources[url]["original_ids"] = {}
-
-                # Track which local ID was used in which subtopic
-                local_id = source_data.get("id")
-                if local_id is not None:
-                    section_sources[url]["original_ids"][subtopic] = local_id
-
-        # Build or update the global citation map with sources from this section
-        master_source_table = state.get("master_source_table", {})
-        global_citation_map = state.get("global_citation_map", {})
-
-        # Add all section sources to global map if not already present
-        for url, source_data in section_sources.items():
+        # Build global citation map from ACTUALLY USED citations
+        global_citation_map = {}
+        citation_counter = 1
+        
+        for citation in all_used_citations:
+            url = citation["url"]
             if url not in global_citation_map:
-                global_citation_map[url] = len(global_citation_map) + 1
-
-            # Also add to master source table if not already there
-            if url not in master_source_table:
-                source_id = f"S{len(master_source_table) + 1}"
-                master_source_table[url] = {
-                    "id": source_id,
-                    "title": source_data.get("title", "Untitled Source"),
-                    "content_preview": "",
-                    "source_type": "web" if not url.endswith(".pdf") else "pdf",
-                    "accessed_date": self.research_date,
-                    "cited_in_sections": set([section_title]),
+                global_citation_map[url] = {
+                    "global_id": citation_counter,
+                    "title": citation["title"],
+                    "url": url,
+                    "used_in_subtopics": [citation["subtopic"]],
                 }
-            elif section_title not in master_source_table[url].get(
-                    "cited_in_sections", set()
-            ):
-                # Update sections where this source is cited
-                master_source_table[url]["cited_in_sections"].add(section_title)
+                citation_counter += 1
+            else:
+                if citation["subtopic"] not in global_citation_map[url]["used_in_subtopics"]:
+                    global_citation_map[url]["used_in_subtopics"].append(citation["subtopic"])
 
-        # Update state
-        self.update_state("global_citation_map", global_citation_map)
-        self.update_state("master_source_table", master_source_table)
+        logger.info(f"Section '{section_title}' has {len(global_citation_map)} unique citations")
 
-        # Verify citations if enabled
-        verified_citations = []
-        flagged_citations = []
-
-        if self.valves.VERIFY_CITATIONS and all_section_citations:
-            # Group citations by URL for efficient verification
-            citations_by_url = {}
-            for citation in all_section_citations:
-                url = citation.get("url")
-                if url:
-                    if url not in citations_by_url:
-                        citations_by_url[url] = []
-                    citations_by_url[url].append(citation)
-
-            # Verify each URL's citations
-            for url, citations in citations_by_url.items():
-                try:
-                    # Get source content
-                    url_results_cache = state.get("url_results_cache", {})
-
-                    # Check cache first
-                    source_content = None
-                    if url in url_results_cache:
-                        source_content = url_results_cache[url]
-
-                    # If not in cache, fetch source content
-                    if not source_content or len(source_content) < 200:
-                        source_content = await self.fetch_content(url)
-
-                    if source_content and len(source_content) >= 200:
-                        # Add global ID to each citation for verification tracking
-                        if url in global_citation_map:
-                            global_id = global_citation_map[url]
-                            for citation in citations:
-                                citation["global_id"] = global_id
-
-                        # Verify citations against source content
-                        verification_results = await self.verify_citation_batch(
-                            url, citations, source_content
-                        )
-
-                        # Sort verified and flagged citations
-                        for result in verification_results:
-                            if result.get("verified", False):
-                                verified_citations.append(result)
-                            elif result.get("flagged", False):
-                                flagged_citations.append(result)
-                    else:
-                        # Mark as unverified but not flagged
-                        for citation in citations:
-                            citation["verified"] = False
-                            citation["flagged"] = False
-                except Exception as e:
-                    logger.error(f"Error verifying citations for URL {url}: {e}")
-                    # Mark as unverified but not flagged
-                    for citation in citations:
-                        citation["verified"] = False
-                        citation["flagged"] = False
-
-        # Now process each subtopic content to:
-        # 1. Apply strikethrough to flagged citations
-        # 2. Replace local citation IDs with global IDs
+        # Process content with SAFE citation replacement
         processed_subtopic_contents = {}
-
+        
         for subtopic, content in subtopic_contents.items():
-            processed_content = content
+            # Get citations used in this specific subtopic
+            subtopic_citations = [c for c in all_used_citations if c["subtopic"] == subtopic]
+            
+            # Build replacement mapping
+            replacement_map = {}
+            for citation in subtopic_citations:
+                local_id = citation["local_id"]
+                url = citation["url"]
+                
+                if url in global_citation_map:
+                    replacement_map[local_id] = global_citation_map[url]["global_id"]
 
-            # Apply strikethrough to flagged citations
-            flagged_sentences_for_subtopic = set()
-            for citation in flagged_citations:
-                if citation.get("subtopic") == subtopic and citation.get("text"):
-                    flagged_sentences_for_subtopic.add(citation.get("text"))
-
-            if flagged_sentences_for_subtopic:
-                # Split content into sentences
-                sentences = re.split(r"(?<=[.!?])\s+", processed_content)
-                modified_sentences = []
-
-                for sentence in sentences:
-                    modified_sentence = sentence
-
-                    # Check if this is a flagged sentence
-                    for flagged_text in flagged_sentences_for_subtopic:
-                        if flagged_text in sentence:
-                            # Apply strikethrough
-                            modified_sentence = f"~~{modified_sentence}~~"
-                            break
-
-                    modified_sentences.append(modified_sentence)
-
-                # Join sentences back together
-                processed_content = " ".join(modified_sentences)
-
-                # Track applied strikethroughs
-                citation_fixes = state.get("citation_fixes", [])
-                for flagged_text in flagged_sentences_for_subtopic:
-                    citation_fixes.append(
-                        {
-                            "section": section_title,
-                            "subtopic": subtopic,
-                            "reason": "Citation could not be verified",
-                            "original_text": flagged_text,
-                        }
-                    )
-                self.update_state("citation_fixes", citation_fixes)
-
-            # Now replace all local citation IDs with global IDs using context-aware replacement
-            # First handle single citations - standard pattern [n]
-            for url, source_data in section_sources.items():
-                # Check if this URL has a local ID for this specific subtopic
-                original_ids = source_data.get("original_ids", {})
-                local_id = original_ids.get(subtopic)
-
-                if local_id is not None and url in global_citation_map:
-                    global_id = global_citation_map[url]
-
-                    # Replace local citation ID with global ID
-                    pattern = r"\[" + re.escape(str(local_id)) + r"\]"
-                    processed_content = re.sub(
-                        pattern, f"[{global_id}]", processed_content
-                    )
-
-            # Now handle combined citations like [1, 2] or [1,2]
-            # First, extract all citation groups from content
-            combined_citation_pattern = r"\[(\d+(?:\s*,\s*\d+)+)\]"
-            combined_matches = re.finditer(combined_citation_pattern, processed_content)
-
-            # Process each combined citation group
-            for match in combined_matches:
-                original_citation = match.group(
-                    0
-                )  # The full citation group e.g. "[1, 2, 3]"
-                citation_ids = match.group(1)  # Just the IDs part e.g. "1, 2, 3"
-
-                # Extract individual IDs (handles both [1,2] and [1, 2] formats)
-                local_ids = [
-                    int(id_str.strip()) for id_str in re.split(r"\s*,\s*", citation_ids)
-                ]
-
-                # Convert each local ID to its global ID
-                global_ids = []
-                for local_id in local_ids:
-                    # Find the URL(s) that had this local ID in this subtopic
-                    for url, source_data in section_sources.items():
-                        original_ids = source_data.get("original_ids", {})
-                        if (
-                                subtopic in original_ids
-                                and original_ids[subtopic] == local_id
-                        ):
-                            if url in global_citation_map:
-                                global_ids.append(str(global_citation_map[url]))
-
-                # If we found global IDs, create the replacement citation
-                if global_ids:
-                    global_citation = f"[{', '.join(global_ids)}]"
-                    # Replace just this specific citation instance
-                    processed_content = processed_content.replace(
-                        original_citation, global_citation, 1
-                    )
-
+            # Apply replacements safely
+            processed_content = self.safe_citation_replacement(content, replacement_map)
             processed_subtopic_contents[subtopic] = processed_content
 
-        # Combine subtopic contents into a section draft
+        # Combine subtopics
         combined_content = ""
         for subtopic, content in processed_subtopic_contents.items():
-            # Add subtopic heading
-            combined_content += f"\n\n### {subtopic}\n\n"
-            combined_content += f"{content}\n\n"
+            combined_content += f"\n\n### {subtopic}\n\n{content}\n\n"
 
-        # Only do smoothing if we have multiple subtopics
+        # Smooth transitions if needed
         if len(subtopics) > 1:
-            # Review and smooth transitions between subtopics
-            section_content = await self.smooth_section_transitions(
-                section_title,
-                subtopics,
-                combined_content,
-                original_query,
-                synthesis_model,
-            )
+            try:
+                section_content = await self.smooth_section_transitions(
+                    section_title, subtopics, combined_content,
+                    original_query, synthesis_model
+                )
+            except Exception as e:
+                logger.warning(f"Section smoothing failed: {e}")
+                section_content = combined_content
         else:
             section_content = combined_content
 
-        # Track token counts
-        memory_stats = state.get("memory_stats", {})
-        section_tokens = memory_stats.get("section_tokens", {})
-        section_tokens[section_title] = total_tokens
-        memory_stats["section_tokens"] = section_tokens
-        self.update_state("memory_stats", memory_stats)
+        # Update state
+        state = self.get_state()
+        
+        # Preserve FULL citation objects (not just IDs)
+        state["global_citation_map"] = global_citation_map
+        
+        # Update master source table
+        master_source_table = state.get("master_source_table", {})
+        for url in global_citation_map:
+            if url in master_source_table:
+                master_source_table[url]["cited_in_sections"] = master_source_table[url].get("cited_in_sections", set())
+                master_source_table[url]["cited_in_sections"].add(section_title)
+        
+        self.update_state("master_source_table", master_source_table)
 
-        # Store content for later use
+        # Store section content
         section_synthesized_content = state.get("section_synthesized_content", {})
         section_synthesized_content[section_title] = section_content
         self.update_state("section_synthesized_content", section_synthesized_content)
 
-        # Store section sources for later citation correlation
-        section_sources_map = state.get("section_sources_map", {})
-        section_sources_map[section_title] = section_sources
-        self.update_state("section_sources_map", section_sources_map)
-
-        # Store all citations for this section
-        section_citations = state.get("section_citations", {})
-        section_citations[section_title] = all_section_citations
-        self.update_state("section_citations", section_citations)
-
-        # Show section completion status
-        await self.emit_status(
-            "info",
-            f"Section generated: {section_title}",
-            False,
-        )
+        # Final validation
+        final_citations = set(re.findall(r'\[(\d+)\]', section_content))
+        logger.info(f"Final citations in content: {final_citations}")
+        logger.info(f"Global citation map IDs: {set(str(v['global_id']) for v in global_citation_map.values())}")
 
         return {
             "content": section_content,
             "tokens": total_tokens,
-            "sources": section_sources,
-            "citations": all_section_citations,
-            "verified_citations": verified_citations,
-            "flagged_citations": flagged_citations,
+            "sources": global_citation_map,
+            "citations": all_used_citations,
         }
+
 
     async def smooth_section_transitions(
             self,
@@ -8360,119 +7888,96 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             return combined_content
 
     async def generate_bibliography(self, master_source_table, global_citation_map):
-        """Generate a bibliography using sequential numbering based on actual citations in the report"""
-        if not master_source_table:
-            return {
-                "bibliography": [],
-                "title_to_global_id": {},
-                "url_to_global_id": {},
-            }
-
-        # First, scan all compiled sections to find actually cited sources
-        state = self.get_state()
-        compiled_sections = state.get("section_synthesized_content", {})
-
-        # Extract all citation numbers from the compiled text
-        cited_numbers = set()
-        for section_content in compiled_sections.values():
-            # Find all citations in format [n] where n is a number
-            citation_matches = re.findall(r"\[(\d+)\]", section_content)
-            for num in citation_matches:
-                cited_numbers.add(int(num))
-
-        # Filter global_citation_map to only include cited sources
-        cited_urls = {}
-        for url, id_num in global_citation_map.items():
-            if id_num in cited_numbers:
-                cited_urls[url] = id_num
-
-        # Sort URLs by their assigned citation ID
-        sorted_urls = sorted(cited_urls.items(), key=lambda x: x[1])
-
-        # Create bibliography entries based on cited sources only
+        """Generate bibliography - ONLY from actual research sources"""
+        
         bibliography = []
-        url_to_global_id = {}
-        title_to_global_id = {}
-
-        # Use the sequential numbers already assigned in global_citation_map
-        for url, global_id in sorted_urls:
-            # Get source data from master_source_table if available
+        
+        # STRICT validation - only include URLs that exist in master_source_table
+        validated_citation_map = {}
+        
+        for url, citation_data in global_citation_map.items():
             if url in master_source_table:
+                validated_citation_map[url] = citation_data
                 source_data = master_source_table[url]
-                title = source_data.get("title", "Untitled Source")
-            else:
-                logger.warning(
-                    f"URL {url} in global_citation_map not found in master_source_table"
-                )
-                title = f"Source {global_id}"
-
-            # Add bibliography entry using the actual correlated URL
-            bibliography.append(
-                {
-                    "id": global_id,
-                    "title": title,
+                
+                try:
+                    id_value = int(citation_data["global_id"])
+                except (ValueError, TypeError):
+                    id_value = 0
+                
+                bibliography.append({
+                    "id": id_value,
+                    "title": source_data.get("title", "Untitled Source"),
                     "url": url,
-                }
-            )
-
-            # Create mappings
-            url_to_global_id[url] = global_id
-            title_to_global_id[title] = global_id
-
-        # Sort bibliography by citation ID
+                })
+            else:
+                logger.error(f"REMOVING HALLUCINATED CITATION: {url} not found in master_source_table")
+        
+        # Update global_citation_map to only contain validated entries
+        global_citation_map.clear()
+        global_citation_map.update(validated_citation_map)
+        
+        # Sort by ID
         bibliography.sort(key=lambda x: x["id"])
+        
+        logger.info(f"Generated bibliography with {len(bibliography)} VALIDATED citations")
+        
+        return {"bibliography": bibliography}
 
-        logger.info(
-            f"Generated bibliography with {len(bibliography)} cited entries (from {len(global_citation_map)} total sources)"
-        )
-        return {
-            "bibliography": bibliography,
-            "title_to_global_id": title_to_global_id,
-            "url_to_global_id": url_to_global_id,
-        }
-    def renumber_citations_in_content(self, content):
-        """Update citation numbers in content to match sequential bibliography"""
-        state = self.get_state()
-        id_mapping = state.get("final_id_mapping", {})
+    async def validate_global_citation_map(self, global_citation_map, master_source_table):
+        """Validate and clean global_citation_map before bibliography generation"""
         
-        if not id_mapping:
-            return content
+        validated_map = {}
+        removed_count = 0
         
-        # Replace citations with new sequential numbers
-        for old_id, new_id in id_mapping.items():
-            # Replace [old_id] with [new_id]
-            content = re.sub(rf'\[{old_id}\]', f'[{new_id}]', content)
+        for url, citation_data in global_citation_map.items():
+            if url in master_source_table:
+                validated_map[url] = citation_data
+            else:
+                logger.warning(f"REMOVING invalid citation: {url} not in research sources")
+                removed_count += 1
         
-        return content
+        if removed_count > 0:
+            logger.info(f"Removed {removed_count} invalid citations from global_citation_map")
+        
+        return validated_map
+
+    async def add_bibliography_once(self, comprehensive_answer, bibliography_table):
+        """Add bibliography only once and in the right place"""
+        
+        # Check if bibliography already exists
+        if "## Bibliography" in comprehensive_answer or "## References" in comprehensive_answer:
+            logger.info("Bibliography already exists, not adding duplicate")
+            return comprehensive_answer
+        
+        # Add bibliography before the research date
+        if "*Research conducted on:" in comprehensive_answer:
+            # Insert before research date
+            date_pos = comprehensive_answer.find("*Research conducted on:")
+            comprehensive_answer = (
+                comprehensive_answer[:date_pos] + 
+                f"{bibliography_table}\n\n" + 
+                comprehensive_answer[date_pos:]
+            )
+        else:
+            # Add at the end
+            comprehensive_answer += f"{bibliography_table}\n\n"
+        
+        return comprehensive_answer
     async def format_bibliography_list(self, bibliography):
-        """Format the bibliography as a numbered list with sequential numbering"""
+        """Format the bibliography as a numbered list - FIXED VERSION"""
         if not bibliography:
             return ""
 
         bib_list = "\n\n## Bibliography\n\n"
         
-        # Sort bibliography by current ID to maintain order
-        sorted_bib = sorted(bibliography, key=lambda x: x.get("id", 0))
-        
-        # Renumber sequentially starting from 1
-        id_mapping = {}
-        for i, entry in enumerate(sorted_bib, 1):
-            old_id = entry.get("id", i)
-            id_mapping[old_id] = i
-            entry["id"] = i  # Update the entry with new sequential ID
-        
-        # Add each bibliography entry with sequential numbering
-        for entry in sorted_bib:
+        # Bibliography should already be sorted by ID
+        for entry in bibliography:
             citation_id = entry["id"]
             title = entry.get("title", "Untitled")
             url = entry.get("url", "")
             
             bib_list += f"[{citation_id}] {title}. [{url}]({url})\n\n"
-        
-        # Store the ID mapping for updating citations in content
-        state = self.get_state()
-        state["final_id_mapping"] = id_mapping
-        self.update_state("final_id_mapping", id_mapping)
         
         return bib_list
     
@@ -8595,40 +8100,29 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             logger.error(f"Error verifying batch of citations: {e}")
             return []
 
-    async def verify_citations(
-            self, global_citation_map, citations_by_section, master_source_table
-    ):
-        """Verify citations in smaller batches"""
+    async def verify_citations(self, global_citation_map, citations_by_section, master_source_table):
+        """Verify citations - SIMPLIFIED VERSION"""
         if not self.valves.VERIFY_CITATIONS:
-            await self.emit_status("info", "Citation verification is disabled", False)
             return {"verified": [], "flagged": []}
 
-        # Count citations to verify
-        total_citations = sum(
-            len(section_citations)
-            for section_citations in citations_by_section.values()
-        )
-        if total_citations == 0:
-            await self.emit_status("info", "No citations to verify", False)
-            return {"verified": [], "flagged": []}
-
-        # Group citations by source URL for efficient verification
-        citations_by_source = {}
-        for section, section_citations in citations_by_section.items():
+        # Use the EXISTING global_citation_map - don't modify it
+        verification_results = {"verified": [], "flagged": []}
+        
+        # Group citations by URL for efficient verification
+        citations_by_url = {}
+        for section_citations in citations_by_section.values():
             for citation in section_citations:
                 url = citation.get("url")
-                if not url:
-                    continue
-
-                if url not in citations_by_source:
-                    citations_by_source[url] = []
-
-                citations_by_source[url].append(citation)
-
+                if url and url in global_citation_map:  # Only verify URLs we know about
+                    if url not in citations_by_url:
+                        citations_by_url[url] = []
+                    citation["global_id"] = global_citation_map[url]["global_id"]
+                    citations_by_url[url].append(citation)
+        
         # Ensure verification uses global IDs by updating each citation
         for url, citations in citations_by_source.items():
             if url in global_citation_map:
-                global_id = global_citation_map[url]
+                global_id = global_citation_map[url]["global_id"]
                 for citation in citations:
                     # Update marker to use global ID for verification tracking
                     citation["global_id"] = global_id
@@ -8653,7 +8147,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         ):
                             # Add to global citation map if not already there
                             if url not in global_citation_map:
-                                global_citation_map[url] = len(global_citation_map) + 1
+                                global_citation_map[url] = {
+                                    "global_id": len(global_citation_map) + 1,
+                                    "title": "Additional Citation",
+                                    "url": url,
+                                    "used_in_subtopics": [],
+                                }
 
                             # Create tracking for this citation
                             if url not in numeric_citations_by_url:
@@ -8674,7 +8173,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                                         "text": context,
                                         "url": url,
                                         "section": section,
-                                        "global_id": global_citation_map[url],
+                                        "global_id": global_citation_map[url]["global_id"],
                                     }
                                 )
                             break
@@ -8796,8 +8295,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     numeric_id = int(num)
                     # Check if this number appears in the global citation map values
                     found_match = False
-                    for url, global_id in global_citation_map.items():
-                        if global_id == numeric_id:
+                    for url, citation_data in global_citation_map.items():
+                        if global_citation_map[url]["global_id"] == numeric_id:
                             found_match = True
                             break
 
@@ -8843,7 +8342,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         return verification_results
 
     async def export_research_data(self) -> Dict:
-        """Export the full research data including results, queries, timestamps, URLs, and content"""
+        """Export research data into two files: clean report and detailed sources"""
         import os
         import json
         from datetime import datetime
@@ -8855,21 +8354,37 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         export_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         file_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # CRITICAL FIX: If no results_history, create from available sources
+        # Generate base filename
+        query_text = state.get("research_state", {}).get("user_message", "research")
+        query_for_filename = (
+            "".join(c if c.isalnum() or c in " -_" else "_" for c in query_text[:30])
+            .strip()
+            .replace(" ", "_")
+        )
+        
+        base_filename = f"research_export_{query_for_filename}_{file_timestamp}"
+        export_dir = os.getcwd()
+        
+        # File paths
+        report_filepath = os.path.join(export_dir, f"{base_filename}.txt")
+        sources_filepath = os.path.join(export_dir, f"{base_filename}_sources.txt")
+
+        # Get comprehensive answer
+        comprehensive_answer = state.get("prev_comprehensive_summary", "")
+        
+        # CRITICAL FIX: Handle missing results_history same as before
         if len(results_history) == 0:
             logger.warning("No results_history available, creating from available sources")
             
             master_source_table = state.get("master_source_table", {})
             content_cache = state.get("content_cache", {})
-            comprehensive_answer = state.get("prev_comprehensive_summary", "")
             
             # Create synthetic results from master sources
             synthetic_results = []
             for url, source_data in master_source_table.items():
-                # Try to get content from cache first
                 content = ""
                 if url in content_cache and isinstance(content_cache[url], dict):
-                    content = content_cache[url].get("content", "")[:2000]  # First 2000 chars
+                    content = content_cache[url].get("content", "")[:2000]
                 
                 if not content:
                     content = source_data.get("content_preview", "")
@@ -8880,17 +8395,15 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     "title": source_data.get("title", "Research Source"),
                     "tokens": len(content.split()) if content else 0,
                     "content": content,
-                    "similarity": 0.5,  # Default similarity
+                    "similarity": 0.5,
                     "timestamp": export_timestamp
                 }
                 synthetic_results.append(synthetic_result)
             
-            # Use synthetic results if we created any
             if synthetic_results:
                 results_history = synthetic_results
                 logger.info(f"Created {len(synthetic_results)} synthetic results for export")
             else:
-                # Last resort: create one result with the comprehensive answer
                 if comprehensive_answer:
                     synthetic_results = [{
                         "query": state.get("research_state", {}).get("user_message", "research query"),
@@ -8902,108 +8415,53 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         "timestamp": export_timestamp
                     }]
                     results_history = synthetic_results
-                    logger.info("Created comprehensive answer result for export")
 
-        # Prepare the export data structure
-        export_data = {
-            "export_timestamp": export_timestamp,
-            "research_date": self.research_date,
-            "original_query": state.get("research_state", {}).get(
-                "user_message", "Unknown query"
-            ),
-            "results_count": len(results_history),
-            "results": [],
-        }
-
-        # Process each result to include in the export
-        for i, result in enumerate(results_history):
-            # Add timestamp to result if not already present
-            if "timestamp" not in result:
-                # As a fallback, create a synthetic timestamp based on position in history
-                from datetime import timedelta
-
-                synthetic_time = datetime.now() - timedelta(
-                    minutes=(len(results_history) - i)
-                )
-                result_timestamp = synthetic_time.strftime("%Y-%m-%d %H:%M:%S")
+        # === FILE 1: CLEAN RESEARCH REPORT ===
+        with open(report_filepath, "w", encoding="utf-8") as f:
+            f.write(f"# Research Report Export\n")
+            f.write(f"# Query: {state.get('research_state', {}).get('user_message', 'Unknown')}\n")
+            f.write(f"# Date: {export_timestamp}\n")
+            f.write(f"# Sources Used: {len(state.get('master_source_table', {}))}\n\n")
+            
+            if comprehensive_answer:
+                f.write(comprehensive_answer)
             else:
-                result_timestamp = result.get("timestamp")
+                f.write("No comprehensive research report available.\n")
+                f.write("This may indicate the research process was interrupted or incomplete.\n")
 
-            # Format the result for export
-            export_result = {
-                "index": i + 1,
-                "timestamp": result_timestamp,
-                "query": result.get("query", "Unknown query"),
-                "url": result.get("url", ""),
-                "title": result.get("title", "Untitled"),
-                "tokens": result.get("tokens", 0),
-                "content": result.get("content", ""),
-                "similarity": result.get("similarity", 0.0),
-            }
-
-            export_data["results"].append(export_result)
-
-        # Generate filename based on the research query (sanitized) and timestamp
-        query_text = state.get("research_state", {}).get("user_message", "research")
-        # Sanitize the query for a filename (first 30 chars, remove unsafe chars)
-        query_for_filename = (
-            "".join(c if c.isalnum() or c in " -_" else "_" for c in query_text[:30])
-            .strip()
-            .replace(" ", "_")
-        )
-        filename = f"research_export_{query_for_filename}_{file_timestamp}.txt"
-
-        # Determine file path
-        # Use OpenWebUI directory (or fallback to current directory)
-        try:
-            # Determine file path - export to current directory
-            export_dir = os.getcwd()
-            filepath = os.path.join(export_dir, filename)
-
-            # Ensure the directory exists (should always exist for current dir, but just in case)
-            os.makedirs(export_dir, exist_ok=True)
-        except:
-            export_dir = os.getcwd()  # Fallback to current directory
-
-        filepath = os.path.join(export_dir, filename)
-
-        # Ensure the directory exists
-        os.makedirs(export_dir, exist_ok=True)
-
-        # Write export data to file
-        with open(filepath, "w", encoding="utf-8") as f:
-            # Write a human-readable header
-            f.write(f"# Research Export: {export_data['original_query']}\n")
-            f.write(f"# Date: {export_data['export_timestamp']}\n")
-            f.write(f"# Results: {export_data['results_count']}\n\n")
+        # === FILE 2: DETAILED SOURCE DATA ===
+        with open(sources_filepath, "w", encoding="utf-8") as f:
+            f.write(f"# Research Sources & Raw Data\n")
+            f.write(f"# Query: {state.get('research_state', {}).get('user_message', 'Unknown')}\n")
+            f.write(f"# Date: {export_timestamp}\n")
+            f.write(f"# Total Sources: {len(results_history)}\n\n")
 
             # Write each result with clear separation
-            for result in export_data["results"]:
-                f.write(f"=== RESULT {result['index']} ===\n")
-                f.write(f"Timestamp: {result['timestamp']}\n")
-                f.write(f"Query: {result['query']}\n")
-                f.write(f"URL: {result['url']}\n")
-                f.write(f"Title: {result['title']}\n")
-                f.write(f"Tokens: {result['tokens']}\n")
-                f.write(f"Similarity: {result['similarity']}\n")
+            for i, result in enumerate(results_history):
+                # Add timestamp if missing
+                if "timestamp" not in result:
+                    from datetime import timedelta
+                    synthetic_time = datetime.now() - timedelta(minutes=(len(results_history) - i))
+                    result_timestamp = synthetic_time.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    result_timestamp = result.get("timestamp")
+
+                f.write(f"=== SOURCE {i + 1} ===\n")
+                f.write(f"Timestamp: {result_timestamp}\n")
+                f.write(f"Query: {result.get('query', 'Unknown query')}\n")
+                f.write(f"URL: {result.get('url', '')}\n")
+                f.write(f"Title: {result.get('title', 'Untitled')}\n")
+                f.write(f"Tokens: {result.get('tokens', 0)}\n")
+                f.write(f"Similarity: {result.get('similarity', 0.0)}\n")
                 f.write("\nCONTENT:\n")
-                f.write(f"{result['content']}\n\n")
+                f.write(f"{result.get('content', '')}\n\n")
                 f.write("=" * 50 + "\n\n")
 
-            # Add the comprehensive answer at the end if available
-            comprehensive_answer = state.get("prev_comprehensive_summary", "")
-            if comprehensive_answer:
-                f.write("\n" + "="*60 + "\n")
-                f.write("COMPREHENSIVE RESEARCH REPORT\n")
-                f.write("="*60 + "\n\n")
-                f.write(comprehensive_answer)
-                f.write("\n\n")
-
         return {
-            "export_data": export_data,
-            "txt_filepath": filepath,
+            "report_filepath": report_filepath,
+            "sources_filepath": sources_filepath,
+            "export_timestamp": export_timestamp
         }
-
     async def add_verification_note(self, comprehensive_answer):
         """Add a note about strikethrough citations if any were flagged"""
         state = self.get_state()
@@ -9650,7 +9108,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             # Fallback abstract
             await self.emit_message(f"*Abstract generation error, using fallback.*\n")
             return f"This research report addresses the query: '{user_message}'. It synthesizes information from {len(bibliography)} sources to provide a comprehensive analysis of the topic, examining key aspects and presenting relevant findings."
-
+    def renumber_citations_in_content(self, content):
+        """Placeholder - citations should already be properly numbered"""
+        return content
     async def pipe(
             self,
             body: dict,
@@ -11064,10 +10524,31 @@ Format your response as a valid JSON object with the following structure:
                 for citation in section_citations:
                     url = citation.get("url", "")
                     if url and url not in global_citation_map:
-                        global_citation_map[url] = len(global_citation_map) + 1
+                        global_citation_map[url] = {
+                        "global_id": len(global_citation_map) + 1,
+                        "title": "Additional Citation",
+                        "url": url,
+                        "used_in_subtopics": [],
+                    }
 
-        # Update global citation map with any new URLs found
+
         self.update_state("global_citation_map", global_citation_map)
+
+        # Validate all citations before generating bibliography
+        await self.emit_synthesis_status("Validating citations...")
+        global_citation_map = await self.validate_global_citation_map(
+            global_citation_map, master_source_table
+        )
+
+        # Update state with cleaned citation map
+        self.update_state("global_citation_map", global_citation_map)
+
+        # Generate bibliography from citation data
+        await self.emit_synthesis_status("Generating bibliography...")
+        bibliography_data = await self.generate_bibliography(
+            master_source_table, global_citation_map
+        )
+
 
         # Generate bibliography from citation data
         await self.emit_synthesis_status("Generating bibliography...")
@@ -11090,7 +10571,7 @@ Format your response as a valid JSON object with the following structure:
                 raw_text = citation.get("raw_text", "")
 
                 if url and url in global_citation_map and raw_text:
-                    global_id = global_citation_map[url]
+                    global_id = global_citation_map[url]["global_id"]
                     # Replace the original citation text with the global ID
                     modified_content = modified_content.replace(
                         raw_text, f"[{global_id}]"
@@ -11305,12 +10786,15 @@ Format your response as a valid JSON object with the following structure:
                 "Conclusion generation failed, using fallback"
             )
 
-        # Add verification note if any citations were flagged
+        # Add verification note
         comprehensive_answer = await self.add_verification_note(comprehensive_answer)
 
-
-        # Add verification note if any citations were flagged
-        comprehensive_answer = await self.add_verification_note(comprehensive_answer)
+        # Only add bibliography if it's not already there
+        if "## Bibliography" not in comprehensive_answer and "## References" not in comprehensive_answer:
+            comprehensive_answer += f"{bibliography_table}\n\n"
+            logger.info("Added bibliography at end of document")
+        else:
+            logger.info("Bibliography already exists, skipping duplicate")
 
         # Debug: Check what's already in comprehensive_answer
         bib_count = comprehensive_answer.count("## Bibliography")
@@ -11329,9 +10813,7 @@ Format your response as a valid JSON object with the following structure:
                 end = min(len(comprehensive_answer), bib_pos + 300)
                 logger.info(f"Context around first bibliography: ...{comprehensive_answer[start:end]}...")
 
-        comprehensive_answer = self.renumber_citations_in_content(comprehensive_answer)
-        # Add bibliography
-        comprehensive_answer += f"{bibliography_table}\n\n"
+        comprehensive_answer = await self.add_bibliography_once(comprehensive_answer, bibliography_table)
 
         # Add research date
         comprehensive_answer += f"*Research conducted on: {self.research_date}*\n\n"
@@ -11381,17 +10863,16 @@ Format your response as a valid JSON object with the following structure:
                 await self.emit_status("info", "Exporting research data...", False)
                 export_result = await self.export_research_data()
 
-                # Output information about where the export was saved
-                txt_filepath = export_result.get("txt_filepath", "")
-                # json_filepath = export_result.get("json_filepath", "")
+                report_filepath = export_result.get("report_filepath", "")
+                sources_filepath = export_result.get("sources_filepath", "")
 
                 export_message = (
                     f"\n\n---\n\n**Research Data Exported**\n\n"
-                    f"Research data has been exported to:\n"
-                    f"- Text file: `{txt_filepath}`\n\n"
-                    f"This file contain all research results, queries, timestamps, and content for future reference."
+                    f"Research has been exported to:\n"
+                    f"- **Clean Report**: `{report_filepath}`\n"
+                    f"- **Source Data**: `{sources_filepath}`\n\n"
+                    f"The report file contains the final research document, while the sources file contains all raw research data for reference."
                 )
-
                 await self.emit_message(export_message)
 
             except Exception as e:
