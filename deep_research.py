@@ -20,10 +20,7 @@ from pydantic import BaseModel, Field
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
-#from open_webui.constants import TASKS
-#from open_webui.main import generate_chat_completions
-#from open_webui.models.users import User
-
+from deep_storage import ResearchKnowledgeBase, DeepResearchIntegration
 name = "Deep Research at Home"
 
 
@@ -502,6 +499,38 @@ class Pipe:
             ge=1,
             le=2,
         )
+        USE_KNOWLEDGE_BASE: bool = Field(
+            default=True,
+            description="Enable local knowledge base for faster research"
+        )
+        
+        KB_MIN_SIMILARITY: float = Field(
+            default=0.5,
+            description="Minimum similarity threshold for knowledge base results",
+            ge=0.0,
+            le=1.0,
+        )
+        
+        KB_LOCAL_SOURCES_THRESHOLD: int = Field(
+            default=2,
+            description="Minimum local sources before web search",
+            ge=1,
+            le=10,
+        )
+        
+        KB_MAX_SOURCES_PER_QUERY: int = Field(
+            default=5,
+            description="Maximum sources to retrieve from knowledge base per query",
+            ge=1,
+            le=20,
+        )
+        
+        KB_CLEANUP_DAYS: int = Field(
+            default=30,
+            description="Days after which to clean up old knowledge base entries",
+            ge=7,
+            le=365,
+        )       
 
     def __init__(self):
         self.type = "manifold"
@@ -524,7 +553,10 @@ class Pipe:
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.valves.THREAD_WORKERS
         )
-
+        self.knowledge_base = ResearchKnowledgeBase()
+        self.kb_integration = DeepResearchIntegration(self.knowledge_base)
+        self.kb_stats = {"total_sources": 0, "last_updated": None}
+        
     async def initialize_research_state(
             self,
             user_message,
@@ -3860,7 +3892,26 @@ class Pipe:
                                     self.update_state(
                                         "master_source_table", master_source_table
                                     )
-
+                                    try:
+                                        if hasattr(self, 'knowledge_base') and getattr(self.valves, 'USE_KNOWLEDGE_BASE', True):
+                                            kb_source = {
+                                                "url": url,
+                                                "title": title,
+                                                "content": extracted,
+                                                "tokens": await self.count_tokens(extracted),
+                                                "source_type": "web",
+                                                "similarity": 0.7,  # Slightly lower for archived content
+                                                "fetched_date": self.research_date,
+                                                "archived": True
+                                            }
+                                            
+                                            session_id = f"archive_{self.research_date}_{len(master_source_table)}"
+                                            asyncio.create_task(
+                                                self.knowledge_base.add_sources([kb_source], "archive_fetch", session_id)
+                                            )
+                                            logger.debug(f"Queued archived content for KB: {title[:50]}...")
+                                    except Exception as e:
+                                        logger.error(f"Error storing archived content in KB: {e}")
                                 return extracted_content
 
                             # Handle as normal HTML/text
@@ -3923,6 +3974,26 @@ class Pipe:
                                     self.update_state(
                                         "master_source_table", master_source_table
                                     )
+                                    try:
+                                        if hasattr(self, 'knowledge_base') and getattr(self.valves, 'USE_KNOWLEDGE_BASE', True):
+                                            kb_source = {
+                                                "url": url,
+                                                "title": title,
+                                                "content": extracted_to_cache if extracted_to_cache else extracted,
+                                                "tokens": await self.count_tokens(extracted),
+                                                "source_type": "web",
+                                                "similarity": 0.8,  # Default for fetched content
+                                                "fetched_date": self.research_date
+                                            }
+                                            
+                                            # Store asynchronously to avoid blocking
+                                            session_id = f"fetch_{self.research_date}_{len(master_source_table)}"
+                                            asyncio.create_task(
+                                                self.knowledge_base.add_sources([kb_source], "content_fetch", session_id)
+                                            )
+                                            logger.debug(f"Queued HTML content for KB: {title[:50]}...")
+                                    except Exception as e:
+                                        logger.error(f"Error storing HTML content in KB: {e}")
 
                                 return extracted
 
@@ -4094,7 +4165,25 @@ class Pipe:
                                                 "master_source_table",
                                                 master_source_table,
                                             )
-
+                                        try:
+                                            if hasattr(self, 'knowledge_base') and getattr(self.valves, 'USE_KNOWLEDGE_BASE', True):
+                                                kb_source = {
+                                                    "url": url,
+                                                    "title": title,
+                                                    "content": extracted_content_to_cache if extracted_content_to_cache else extracted_content,
+                                                    "tokens": await self.count_tokens(extracted_content),
+                                                    "source_type": "pdf", 
+                                                    "similarity": 0.8,
+                                                    "fetched_date": self.research_date
+                                                }
+                                                
+                                                session_id = f"fetch_{self.research_date}_{len(master_source_table)}"
+                                                asyncio.create_task(
+                                                    self.knowledge_base.add_sources([kb_source], "content_fetch", session_id)
+                                                )
+                                                logger.debug(f"Queued PDF content for KB: {title[:50]}...")
+                                        except Exception as e:
+                                            logger.error(f"Error storing PDF content in KB: {e}")
                                         return extracted_content
                                     else:
                                         # Handle HTML/text from archive
@@ -4152,7 +4241,26 @@ class Pipe:
                                                     "master_source_table",
                                                     master_source_table,
                                                 )
-
+                                                try:
+                                                    if hasattr(self, 'knowledge_base') and getattr(self.valves, 'USE_KNOWLEDGE_BASE', True):
+                                                        kb_source = {
+                                                            "url": url,
+                                                            "title": title,
+                                                            "content": extracted,
+                                                            "tokens": await self.count_tokens(extracted),
+                                                            "source_type": "web",
+                                                            "similarity": 0.7,  # Slightly lower for archived content
+                                                            "fetched_date": self.research_date,
+                                                            "archived": True
+                                                        }
+                                                        
+                                                        session_id = f"archive_{self.research_date}_{len(master_source_table)}"
+                                                        asyncio.create_task(
+                                                            self.knowledge_base.add_sources([kb_source], "archive_fetch", session_id)
+                                                        )
+                                                        logger.debug(f"Queued archived content for KB: {title[:50]}...")
+                                                except Exception as e:
+                                                    logger.error(f"Error storing archived content in KB: {e}")
                                             return extracted
                                         else:
                                             # Cache the raw content
@@ -5147,7 +5255,7 @@ class Pipe:
                 if "similarity" in result:
                     quality = 0.5 + (result["similarity"] * 0.5)
                 all_content.append((content, quality))
-
+                    
         # Update ALL coverage in a single call
         if all_content:
             # Just grab dimensions once
@@ -6769,7 +6877,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                             logger.info(
                                 f"Using least-seen URL as fallback to ensure research continues"
                             )
-
+                    
                     group_results.append(
                         {
                             "topics": group,
@@ -7504,7 +7612,9 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 "section": section_title,
             }
             source_counter += 1
-
+        logger.info(f"Section '{section_title}' sources mapping:")
+        for url, source_data in sources_for_subtopic.items():
+            logger.info(f"  Local ID {source_data['local_id']} -> {url} -> {source_data['title']}")
         logger.info(f"Subtopic '{subtopic}' will use {len(sources_for_subtopic)} sources")
 
         # =================================================================
@@ -7660,12 +7770,20 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 "flagged_citations": [],
             }
     def safe_citation_replacement(self, content, replacement_map):
+        """Replace citations with debug logging"""
+        logger.info(f"=== CITATION REPLACEMENT DEBUG ===")
+        logger.info(f"Replacement map: {replacement_map}")
+        
         replacements = sorted(
             [(f"[{old}]", f"[{new}]") for old, new in replacement_map.items()],
             key=lambda x: -len(x[0])
         )
+        
         for old, new in replacements:
+            logger.info(f"  Replacing {old} with {new}")
             content = re.sub(fr'(?<!\w){re.escape(old)}(?!\w)', new, content)
+        
+        logger.info(f"=== CITATION REPLACEMENT END ===")
         return content
     async def generate_section_content_with_citations(
             self,
@@ -7678,7 +7796,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             previous_summary: str = "",
     ) -> Dict:
         """Final fixed version with robust citation handling"""
-        
+        logger.info(f"=== SECTION DEBUG START: {section_title} ===")
         # Status tracking
         if not hasattr(self, "_seen_sections"):
             self._seen_sections = set()
@@ -7703,9 +7821,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             total_tokens += subtopic_result.get("tokens", 0)
             all_used_citations.extend(subtopic_result.get("used_citations", []))
 
-        # Build global citation map from ACTUALLY USED citations
-        global_citation_map = {}
-        citation_counter = 1
+        # ADD THIS LINE TO SORT BY LOCAL ID
+        all_used_citations.sort(key=lambda x: x["local_id"])
+
+        state = self.get_state()
+        global_citation_map = state.get("global_citation_map", {})  # Get existing map
+        citation_counter = len(global_citation_map) + 1  # Continue numbering from where we left off
         
         for citation in all_used_citations:
             url = citation["url"]
@@ -7717,9 +7838,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     "used_in_subtopics": [citation["subtopic"]],
                 }
                 citation_counter += 1
-            else:
-                if citation["subtopic"] not in global_citation_map[url]["used_in_subtopics"]:
-                    global_citation_map[url]["used_in_subtopics"].append(citation["subtopic"])
+                
 
         logger.info(f"Section '{section_title}' has {len(global_citation_map)} unique citations")
 
@@ -7889,6 +8008,13 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
     async def generate_bibliography(self, master_source_table, global_citation_map):
         """Generate bibliography - ONLY from actual research sources"""
+        logger.info(f"=== BIBLIOGRAPHY DEBUG START ===")
+        logger.info(f"Master source table has {len(master_source_table)} entries")
+        logger.info(f"Global citation map has {len(global_citation_map)} entries")   
+        for url, citation_data in global_citation_map.items():
+            logger.info(f"Citation map: ID {citation_data['global_id']} -> {url} -> {citation_data['title']}")
+    
+       
         
         bibliography = []
         
@@ -7913,15 +8039,26 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             else:
                 logger.error(f"REMOVING HALLUCINATED CITATION: {url} not found in master_source_table")
         
-        # Update global_citation_map to only contain validated entries
-        global_citation_map.clear()
-        global_citation_map.update(validated_citation_map)
+        # Update global_citation_map to only contain validated entries - PRESERVE ORDER
+        for url in list(global_citation_map.keys()):
+            if url not in validated_citation_map:
+                logger.warning(f"Removing invalid citation: {url}")
+                del global_citation_map[url]
+            else:
+                # Keep the existing entry but update with validated data if needed
+                global_citation_map[url] = validated_citation_map[url]
         
         # Sort by ID
         bibliography.sort(key=lambda x: x["id"])
         
         logger.info(f"Generated bibliography with {len(bibliography)} VALIDATED citations")
+    
+        logger.info(f"Final bibliography has {len(bibliography)} entries:")
+        for entry in bibliography:
+            logger.info(f"  [{entry['id']}] {entry['title']}")
         
+        logger.info(f"=== BIBLIOGRAPHY DEBUG END ===")
+    
         return {"bibliography": bibliography}
 
     async def validate_global_citation_map(self, global_citation_map, master_source_table):
@@ -9108,6 +9245,39 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             # Fallback abstract
             await self.emit_message(f"*Abstract generation error, using fallback.*\n")
             return f"This research report addresses the query: '{user_message}'. It synthesizes information from {len(bibliography)} sources to provide a comprehensive analysis of the topic, examining key aspects and presenting relevant findings."
+
+
+
+    async def debug_citation_sources(self):
+        """Debug function to check citation source alignment"""
+        state = self.get_state()
+        master_source_table = state.get("master_source_table", {})
+        global_citation_map = state.get("global_citation_map", {})
+        
+        logger.info(f"=== CITATION SOURCES DEBUG ===")
+        logger.info(f"Master source table entries:")
+        for url, source_data in master_source_table.items():
+            logger.info(f"  {source_data.get('id', 'NO_ID')} -> {url} -> {source_data.get('title', 'NO_TITLE')}")
+        
+        logger.info(f"Global citation map entries:")
+        for url, citation_data in global_citation_map.items():
+            logger.info(f"  {citation_data.get('global_id', 'NO_ID')} -> {url} -> {citation_data.get('title', 'NO_TITLE')}")
+        
+        # Check for mismatches
+        logger.info(f"Checking for mismatches:")
+        for url in global_citation_map:
+            if url not in master_source_table:
+                logger.error(f"  MISMATCH: {url} in citation map but not in master table")
+        
+        for url in master_source_table:
+            if url not in global_citation_map:
+                logger.warning(f"  UNUSED: {url} in master table but not in citation map")
+        
+        logger.info(f"=== CITATION SOURCES DEBUG END ===")
+
+
+
+
     def renumber_citations_in_content(self, content):
         """Placeholder - citations should already be properly numbered"""
         return content
@@ -9376,6 +9546,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 # Use summary embedding for context relevance
                 initial_results = []
                 initial_seen_urls = set()  # Track URLs seen during initial research
+                session_id = f"followup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
                 for query in initial_queries:
                     # Get query embedding for content comparison
@@ -9394,14 +9565,81 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         logger.error(f"Error getting embedding: {e}")
                         query_embedding = [0] * 384  # Default embedding size
 
-                    # Process the query and get results
-                    results = await self.process_query(
-                        query,
-                        query_embedding,
-                        outline_embedding,
-                        None,
-                        summary_embedding,
-                    )
+                    # First, search local knowledge base
+                    local_results = []
+                    if self.valves.USE_KNOWLEDGE_BASE:
+                        try:
+                            local_results = await self.knowledge_base.search_local(query, n_results=5)
+                            if local_results:
+                                await self.emit_message(f"*Found {len(local_results)} relevant sources in local knowledge base*\n")
+                                
+                                # Convert local results to match expected format
+                                for local_result in local_results:
+                                    local_result['query'] = query
+                                    local_result['valid'] = True
+                                    if 'tokens' not in local_result:
+                                        local_result['tokens'] = await self.count_tokens(local_result['content'])
+                                
+                                # Filter out URLs we've already seen
+                                filtered_local_results = []
+                                for result in local_results:
+                                    url = result.get("url", "")
+                                    if url and url not in initial_seen_urls:
+                                        filtered_local_results.append(result)
+                                        initial_seen_urls.add(url)
+                                fetch_content
+                        except Exception as e:
+                            logger.error(f"Knowledge base error: {e}")
+                            await self.emit_message(f"*Knowledge base temporarily unavailable*\n")
+
+                    # If we don't have enough local results, do web search
+                    if len(local_results) < 2:  # Adjust threshold as needed
+                        web_results = await self.process_query(
+                            query,
+                            query_embedding,
+                            outline_embedding,
+                            None,
+                            summary_embedding,
+                        )
+                        
+                        # Filter out any URLs we've already seen in initial research
+                        filtered_results = []
+                        for result in web_results:
+                            url = result.get("url", "")
+                            if url and url not in initial_seen_urls:
+                                filtered_results.append(result)
+                                initial_seen_urls.add(url)  # Mark this URL as seen
+                            else:
+                                logger.info(
+                                    f"Filtering out repeated URL in initial research: {url}"
+                                )
+
+                        # If we filtered out all results, log it
+                        logger.debug(f"web_results length: {len(web_results)}")
+                        if web_results and not filtered_results:
+                            logger.info(
+                                f"All {len(web_results)} results filtered due to URL repetition in initial research"
+                            )
+                            # If all results were filtered, try to get at least one result by using the first one
+                            if web_results:
+                                filtered_results.append(web_results[0])
+                                logger.info(
+                                    f"Added back one result to ensure minimal research data"
+                                )
+
+                        # Add non-repeated results to our collection
+                        initial_results.extend(filtered_results)
+                        
+                        # Store new web results in knowledge base
+                        if filtered_results and self.valves.USE_KNOWLEDGE_BASE:
+                            try:
+                                logger.debug(f"Adding sources: {[r.get('url') for r in web_results]}")
+                                await self.knowledge_base.add_sources(filtered_results, query, session_id)
+                            except Exception as e:
+                                logger.error(f"Error storing in knowledge base: {e}")
+                    else:
+                        await self.emit_message(f"*Using local sources, skipping web search for: {query}*\n")
+
 
                     # Filter out any URLs we've already seen in initial research
                     filtered_results = []
@@ -9592,6 +9830,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 outline_embedding = await self.get_embedding(user_message)
 
                 initial_results = []
+                session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                
                 for query in initial_queries:
                     # Get query embedding for content comparison
                     try:
@@ -9609,17 +9849,43 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         logger.error(f"Error getting embedding: {e}")
                         query_embedding = [0] * 384  # Default embedding size
 
-                    # Process the query and get results
-                    results = await self.process_query(
-                        query,
-                        query_embedding,
-                        outline_embedding,
-                        None,
-                        summary_embedding,
-                    )
+                    # First, search local knowledge base
+                    local_results = []
+                    if self.valves.USE_KNOWLEDGE_BASE:
+                        try:
+                            local_results = await self.knowledge_base.search_local(query, n_results=5)
+                            if local_results:
+                                await self.emit_message(f"*Found {len(local_results)} relevant sources in local knowledge base*\n")
+                                
+                                # Convert local results to match expected format
+                                for local_result in local_results:
+                                    local_result['query'] = query
+                                    local_result['valid'] = True
+                                    if 'tokens' not in local_result:
+                                        local_result['tokens'] = await self.count_tokens(local_result['content'])
+                                
+                                initial_results.extend(local_results)
+                        except Exception as e:
+                            logger.error(f"Knowledge base error: {e}")
+                            await self.emit_message(f"*Knowledge base temporarily unavailable*\n")
 
-                    # Add successful results to our collection
-                    initial_results.extend(results)
+                    # If we don't have enough local results, do web search
+                    if len(local_results) < 2:  # Adjust threshold as needed
+                        web_results = await self.process_query(
+                            query,
+                            query_embedding,
+                            outline_embedding,
+                            None,
+                            summary_embedding,
+                        )
+                        
+                        # Add successful results to our collection
+                        initial_results.extend(web_results)
+                        logger.debug(f"web_results length: {len(web_results)}")
+
+                    else:
+                        await self.emit_message(f"*Using local sources, skipping web search for: {query}*\n")
+
 
                 # Check if we got any useful results
                 useful_results = [
@@ -9932,6 +10198,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
 
             # Execute searches and process results SEQUENTIALLY
             cycle_results = []
+            cycle_session_id = f"cycle_{cycle}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
             for query_obj in current_cycle_queries:
                 query = query_obj.get("query", "")
                 topic = query_obj.get("topic", "")
@@ -9955,18 +10223,54 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     if transformed_query:
                         query_embedding = transformed_query
 
-                # Process the query and get results
-                results = await self.process_query(
-                    query,
-                    query_embedding,
-                    outline_embedding,
-                    None,
-                    summary_embedding,
-                )
+                # First, search local knowledge base
+                local_results = []
+                if self.valves.USE_KNOWLEDGE_BASE:
+                    try:
+                        local_results = await self.knowledge_base.search_local(
+                            query, 
+                            n_results=3,
+                            min_similarity=self.valves.KB_MIN_SIMILARITY
+                        )
+                        
+                        if local_results:
+                            await self.emit_message(f"*Found {len(local_results)} local sources for cycle {cycle} query: {query}*\n")
+                            
+                            # Convert local results to match expected format
+                            for local_result in local_results:
+                                local_result['query'] = query
+                                local_result['topic'] = topic
+                                local_result['valid'] = True
+                                if 'tokens' not in local_result:
+                                    local_result['tokens'] = await self.count_tokens(local_result['content'])
+                            
+                            cycle_results.extend(local_results)
+                    except Exception as e:
+                        logger.error(f"Knowledge base error in cycle {cycle}: {e}")
+                        await self.emit_message(f"*Knowledge base temporarily unavailable for cycle {cycle}*\n")
 
-                # Add successful results to the cycle results and history
-                cycle_results.extend(results)
-                results_history.extend(results)
+                # Determine if we need web search
+                need_web_search = len(local_results) < self.valves.KB_LOCAL_SOURCES_THRESHOLD
+                
+                if need_web_search:
+                    # Process web search query
+                    web_results = await self.process_query(
+                        query,
+                        query_embedding,
+                        outline_embedding,
+                        None,
+                        summary_embedding,
+                    )
+                    
+                    # Add successful results to the cycle results
+                    cycle_results.extend(web_results)
+                    logger.debug(f"web_results length: {len(web_results)}")
+ 
+                else:
+                    await self.emit_message(f"*Using local sources, skipping web search for cycle {cycle} query: {query}*\n")
+
+                # Add all results to history
+                results_history.extend(cycle_results)
 
             # Update in state
             self.update_state("results_history", results_history)
@@ -10543,18 +10847,11 @@ Format your response as a valid JSON object with the following structure:
         # Update state with cleaned citation map
         self.update_state("global_citation_map", global_citation_map)
 
-        # Generate bibliography from citation data
         await self.emit_synthesis_status("Generating bibliography...")
         bibliography_data = await self.generate_bibliography(
             master_source_table, global_citation_map
         )
 
-
-        # Generate bibliography from citation data
-        await self.emit_synthesis_status("Generating bibliography...")
-        bibliography_data = await self.generate_bibliography(
-            master_source_table, global_citation_map
-        )
 
         # Final pass to handle non-standard citations and apply strikethrough
         await self.emit_synthesis_status("Finalizing citation formatting...")
