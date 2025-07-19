@@ -1,6 +1,6 @@
 # Deep Research System
 
-Acknowledgement : This project is based on - and reuses code from - atineiatte's (https://github.com/atineiatte) Deep Research At Home (https://github.com/atineiatte/deep-research-at-home)
+Important Acknowledgement : This project is based on - and reuses code from - atineiatte's (https://github.com/atineiatte) Deep Research At Home (https://github.com/atineiatte/deep-research-at-home)
 
 An AI-powered academic research automation system that conducts comprehensive, multi-cycle research with intelligent source discovery, semantic analysis, and structured synthesis.
 
