@@ -1,5 +1,7 @@
 # Deep Research System
 
+Acknowledgement : This project is based on - and reuses code from - atineiatte's (https://github.com/atineiatte) Deep Research At Home (https://github.com/atineiatte/deep-research-at-home)
+
 An AI-powered academic research automation system that conducts comprehensive, multi-cycle research with intelligent source discovery, semantic analysis, and structured synthesis.
 
 ## 🎯 What It Does
@@ -345,8 +347,7 @@ deep-research-system/
 This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## 🙏 Acknowledgments
-
-- Built for Open WebUI pipe integration
+- atineiatte's (https://github.com/atineiatte) for developing Deep Research At Home (https://github.com/atineiatte/deep-research-at-home)
 - Academic database integrations
 - ChromaDB for vector storage
 - spaCy for natural language processing
