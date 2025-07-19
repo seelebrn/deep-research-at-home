@@ -21,7 +21,8 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from deep_storage import ResearchKnowledgeBase, DeepResearchIntegration
-name = "Deep Research at Home"
+from academia import AcademicAPIManager
+name = "Deep Research by ~Cadenza"
 
 
 def setup_logger():
@@ -271,6 +272,7 @@ class Pipe:
     __user__: User
     __model__: str
     __request__: Any
+    
 
     class Valves(BaseModel):
         ENABLED: bool = Field(
@@ -379,7 +381,7 @@ class Pipe:
             default="http://localhost:1234", description="URL for Ollama API"
         )
         SEARCH_URL: str = Field(
-            default="http://192.168.1.1:8888/search?q=",
+            default="http://127.0.0.1:8888/search?q=",
             description="URL for web search API",
         )
         MAX_FAILED_RESULTS: int = Field(
@@ -530,12 +532,82 @@ class Pipe:
             description="Days after which to clean up old knowledge base entries",
             ge=7,
             le=365,
-        )       
+        )      
+        ACADEMIC_PRIORITY: bool = Field(
+            default=True,
+            description="Prioritize academic databases (PubMed, HAL, PEPITE, etc.) over web search",
+        )
+        
+        ACADEMIC_DATABASES: str = Field(
+            default="pubmed,hal,openedition,pepite,theses,cairn,sudoc,arxiv,crossref",  # Added openedition
+            description="Comma-separated list of academic databases to search (pubmed,hal,pepite,sudoc,arxiv,crossref)",
+        )
+        
+        ACADEMIC_RESULTS_PER_QUERY: int = Field(
+            default=3,
+            description="Number of results to fetch from each academic database",
+            ge=1,
+            le=10,
+        )
+        ACADEMIC_SEARCH_STRATEGY: str = Field(
+    default="priority",  # "priority" or "parallel"
+    description="Academic search strategy: 'priority' (primary first, secondary as fallback) or 'parallel' (all at once)"
+        )
 
-    def __init__(self):
+        ARXIV_AS_FALLBACK: bool = Field(
+            default=True,
+            description="Only search ArXiv if other academic sources don't provide enough results"
+        )
+
+        PEPITE_DEBUG_MODE: bool = Field(
+            default=False,
+            description="Enable detailed debugging for Pepite searches"
+        )
+        
+        CROSSREF_EMAIL: str = Field(
+            default="research@example.com",
+            description="Email address for CrossRef API requests (required by their terms)",
+        )
+        VERIFICATION_MODEL: str = Field(
+            default="microsoft/phi-4-reasoning-plus",  # or "llama3.1:70b" for even better verification
+            description="Model for final report verification and quality control"
+        )
+        
+        ENABLE_FINAL_VERIFICATION: bool = Field(
+            default=True,
+            description="Enable final verification of the complete report"
+        )
+        
+        UNLOAD_RESEARCH_MODEL: bool = Field(
+            default=True,
+            description="Unload research model before verification to save memory"
+        )
+        ACADEMIC_FORCE_INITIAL: bool = Field(
+            default=True,
+            description="Force initial searches to use ONLY academic databases before web search"
+        )
+        
+        ACADEMIC_MIN_RESULTS: int = Field(
+            default=5,
+            description="Minimum academic results required before allowing web search"
+        )
+        
+        # Site-specific search configurations
+        THESES_FR_ENABLED: bool = Field(
+            default=True,
+            description="Enable theses.fr search for French academic theses"
+        )
+        
+        CAIRN_ENABLED: bool = Field(
+            default=True,
+            description="Enable shs.cairn.info search for social sciences"
+        )
+
+
+    def __init__(self, base_url="http://localhost:1234/v1", api_key="lm-studio"):
         self.type = "manifold"
         self.valves = self.Valves()
-
+        self.academic_api = None  # Will be initialized when needed
         # Use state manager to isolate conversation states
         self.state_manager = ResearchStateManager()
         self.conversation_id = None  # Will be set during pipe method
@@ -553,10 +625,148 @@ class Pipe:
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.valves.THREAD_WORKERS
         )
-        self.knowledge_base = ResearchKnowledgeBase()
-        self.kb_integration = DeepResearchIntegration(self.knowledge_base)
+        # Knowledge base will be initialized when needed with custom path
+        self.knowledge_base = None
+        self.kb_integration = None
         self.kb_stats = {"total_sources": 0, "last_updated": None}
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key
+        )
+        if hasattr(self.valves, 'DOMAIN_PRIORITY'):
+            current_domains = self.valves.DOMAIN_PRIORITY
+            academic_domains = "pubmed.ncbi.nlm.nih.gov,hal.archives-ouvertes.fr,pepite-depot.univ-lille.fr,arxiv.org,sudoc.fr"
+            if current_domains and not any(domain in current_domains for domain in academic_domains.split(',')):
+                self.valves.DOMAIN_PRIORITY = f"{academic_domains},{current_domains}"
+            elif not current_domains:
+                self.valves.DOMAIN_PRIORITY = f"{academic_domains},.edu,.gov"
+
+
+    async def search_with_academic_priority(self, query: str, max_results: int = 10) -> List[Dict]:
+        """Enhanced search that prioritizes academic databases"""
         
+        # Initialize academic API manager if not exists
+        if not hasattr(self, 'academic_api') or self.academic_api is None:
+            # Import your AcademicAPIManager from academia.py
+            from academia import AcademicAPIManager  # Adjust import path as needed
+            self.academic_api = AcademicAPIManager(self)
+        
+        all_results = []
+        
+        # Step 1: Search academic databases first
+        academic_results = await self.academic_api.search_academic_databases(query, max_results // 2)
+        
+        # Process academic results
+        for result in academic_results:
+            # Calculate tokens
+            content = result.get("content", "")
+            result["tokens"] = await self.count_tokens(content)
+            result["query"] = query
+            
+            # Add to results
+            all_results.append(result)
+        
+        # Step 2: If we need more results, use regular web search
+        remaining_needed = max_results - len(all_results)
+        if remaining_needed > 0:
+            await self.emit_message(f"*Supplementing with {remaining_needed} web search results...*\n")
+            
+            # Use existing web search method
+            web_results = await self.search_web(query)
+            
+            # Add web results (they'll be processed later)
+            for result in web_results[:remaining_needed]:
+                all_results.append(result)
+        
+        return all_results
+
+
+    async def search_with_academic_priority_forced(self, query: str, max_results: int = 10) -> List[Dict]:
+        """Enhanced search that FORCES academic databases first"""
+        
+        if not hasattr(self, 'academic_api') or self.academic_api is None:
+            self.academic_api = AcademicAPIManager(self)
+        
+        all_results = []
+        
+        # FORCE academic search first
+        if self.valves.ACADEMIC_FORCE_INITIAL:
+            await self.emit_message(f"🎓 **Academic Priority Mode**: Searching scholarly databases first...\n\n")
+            
+            academic_results = await self.academic_api.search_academic_databases_with_priority(query, max_results)
+            
+            # Process academic results
+            for result in academic_results:
+                content = result.get("content", "")
+                result["tokens"] = await self.count_tokens(content)
+                result["query"] = query
+                all_results.append(result)
+            
+            await self.emit_message(f"📊 **Academic Search Complete**: Found {len(academic_results)} scholarly sources\n\n")
+            
+            # Check if we have enough academic results
+            if len(academic_results) >= self.valves.ACADEMIC_MIN_RESULTS:
+                await self.emit_message(f"✅ **Sufficient academic sources found** ({len(academic_results)} ≥ {self.valves.ACADEMIC_MIN_RESULTS})\n")
+                await self.emit_message(f"⚡ **Skipping web search** to maintain academic focus\n\n")
+                return all_results
+            else:
+                await self.emit_message(f"⚠️ **Limited academic results** ({len(academic_results)} < {self.valves.ACADEMIC_MIN_RESULTS})\n")
+                await self.emit_message(f"🌐 **Supplementing with targeted web search**...\n\n")
+        
+        # Only do web search if academic results are insufficient
+        remaining_needed = max_results - len(all_results)
+        if remaining_needed > 0:
+            web_results = await self.search_web(query)
+            
+            # Limit web results to what we actually need
+            for result in web_results[:remaining_needed]:
+                all_results.append(result)
+        
+        return all_results
+
+    def initialize_knowledge_base(self, db_name: str = "research"):
+        """Initialize knowledge base with custom database name"""
+        if db_name == "research":
+            db_path = "./DBs/research_knowledge_db"
+        else:
+            db_path = f"./DBs/{db_name}_knowledge_db"
+        
+        self.knowledge_base = ResearchKnowledgeBase(db_path=db_path)
+        self.kb_integration = DeepResearchIntegration(self.knowledge_base)
+        logger.info(f"Knowledge base initialized: {db_name} -> {db_path}")
+        
+    async def display_academic_result(self, result: Dict):
+        """Display academic result in a formatted way"""
+        source = result.get("source", "Academic")
+        title = result.get("title", "Untitled")
+        authors = result.get("authors", [])
+        journal = result.get("journal", "")
+        date = result.get("publication_date", "")
+        url = result.get("url", "")
+        abstract = result.get("abstract", "")
+        
+        # Format authors
+        authors_str = "; ".join(authors[:3])  # Show first 3 authors
+        if len(authors) > 3:
+            authors_str += " et al."
+        
+        # Create formatted display
+        result_text = f"#### {source}: {title}\n"
+        if authors_str:
+            result_text += f"**Authors:** {authors_str}\n"
+        if journal:
+            result_text += f"**Journal:** {journal}\n"
+        if date:
+            result_text += f"**Date:** {date}\n"
+        if url:
+            result_text += f"**URL:** {url}\n"
+        
+        result_text += f"**Tokens:** {result.get('tokens', 0)}\n\n"
+        
+        if abstract:
+            result_text += f"**Abstract:** {abstract[:500]}{'...' if len(abstract) > 500 else ''}\n\n"
+        
+        await self.emit_message(result_text)
     async def initialize_research_state(
             self,
             user_message,
@@ -5153,6 +5363,15 @@ class Pipe:
                         # Track original similarity for logging
                         original_similarity = similarity
 
+                        academic_sources = ["PubMed", "HAL", "SUDOC", "arXiv", "CrossRef", "PEPITE"]
+                        if result.get("source") in academic_sources:
+                            # Get the bonus from valves, default to 0.2 if not set
+                            academic_bonus = getattr(self.valves, "ACADEMIC_QUALITY_BONUS", 0.2)
+                            similarity += academic_bonus
+                            logger.debug(f"Applied academic bonus ({academic_bonus}) to {result.get('source')} result")
+
+
+
                         # Apply domain multiplier if priority domains are set
                         if priority_domains and url:
                             url_lower = url.lower()
@@ -5696,29 +5915,65 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         ):
             return self.valves.SYNTHESIS_MODEL
         return self.valves.RESEARCH_MODEL
-
+    async def generate_structured_completion(
+        self,
+        model: str,
+        messages: List[Dict],
+        response_format: Dict,
+        temperature: float = 0.3,
+        max_tokens: int = 4000
+    ) -> Dict:
+        """Generate completion with structured output using LMStudio"""
+        
+        try:
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                model=model,
+                messages=messages,
+                response_format=response_format,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+            
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": response.choices[0].message.content
+                        }
+                    }
+                ]
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in structured completion: {e}")
+            return {"choices": []}
     async def generate_completion(
             self,
             model: str,
             messages: List[Dict],
             stream: bool = False,
             temperature: Optional[float] = None,
+            response_format: Optional[Dict] = None,  # <-- ADD THIS
     ):
         """Generate a completion from the specified model using LMStudio API"""
         try:
             # Use provided temperature or default from valves
             if temperature is None:
                 temperature = self.valves.TEMPERATURE
-
+                
             payload = {
                 "model": model,
                 "messages": messages,
                 "stream": stream,
                 "temperature": temperature,
-                "max_tokens": 4000,  # Added: LMStudio often requires this
-                # Removed "keep_alive" - that's Ollama-specific
+                "max_tokens": 4000,
             }
-
+            
+            # Add structured output if specified
+            if response_format:
+                payload["response_format"] = response_format
+                
             connector = aiohttp.TCPConnector(force_close=True)
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.post(
@@ -7240,7 +7495,338 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 # Clear waiting flag
                 self.update_state("waiting_for_outline_feedback", False)
                 return outline_items, all_topics, outline_embedding
+   
 
+    async def test_quote_extraction(self, subtopic: str, sources_for_subtopic: Dict):
+        """Test the quote extraction functionality"""
+        
+        logger.info(f"🧪 TESTING quote extraction for subtopic: {subtopic}")
+        logger.info(f"📊 Testing with {len(sources_for_subtopic)} sources")
+        
+        # Test the schema creation
+        try:
+            schema = self.create_quote_extraction_schema()
+            logger.info("✅ Schema creation successful")
+        except Exception as e:
+            logger.error(f"❌ Schema creation failed: {e}")
+            return
+        
+        # Test quote extraction
+        try:
+            quotes = await self.extract_key_quotes_for_subtopic(
+                subtopic, sources_for_subtopic, "test query"
+            )
+            logger.info(f"✅ Quote extraction successful: {len(quotes)} quotes")
+            
+            for i, quote in enumerate(quotes):
+                logger.info(f"Quote {i+1}:")
+                logger.info(f"  Source: [{quote['source_id']}] {quote['title']}")
+                logger.info(f"  Quote: \"{quote['quote']}\"")
+                logger.info(f"  Score: {quote.get('relevance_score', 0):.2f}")
+                logger.info(f"  Type: {quote.get('quote_type', 'unknown')}")
+                
+        except Exception as e:
+            logger.error(f"❌ Quote extraction failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+    # Test specific aspects
+    async def debug_structured_output(self):
+        """Debug the structured output functionality"""
+        
+        test_messages = [
+            {"role": "system", "content": "Extract quotes from the given text."},
+            {"role": "user", "content": "Test content: The study found that 85% of users prefer the new interface."}
+        ]
+        
+        try:
+            schema = self.create_quote_extraction_schema()
+            response = await self.generate_structured_completion(
+                self.get_research_model(),
+                test_messages,
+                response_format=schema,
+                temperature=0.3
+            )
+            
+            logger.info(f"🧪 Test response: {response}")
+            
+            if response and "choices" in response:
+                content = response["choices"][0]["message"]["content"]
+                parsed = json.loads(content)
+                logger.info(f"✅ Structured output test successful: {parsed}")
+            else:
+                logger.error("❌ No valid response from structured output")
+                
+        except Exception as e:
+            logger.error(f"❌ Structured output test failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+
+
+    def create_quote_extraction_schema(self):
+    
+        """Define the JSON schema for quote extraction"""
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "quote_extraction",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "extracted_quotes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "quote": {
+                                        "type": "string",
+                                        "description": "Exact text from source (15-50 words)"
+                                    },
+                                    "relevance_score": {
+                                        "type": "number",
+                                        "minimum": 0.0,
+                                        "maximum": 1.0,
+                                        "description": "Relevance to subtopic (0.0-1.0)"
+                                    },
+                                    "quote_type": {
+                                        "type": "string",
+                                        "enum": ["statistic", "finding", "expert_statement", "definition", "example"],
+                                        "description": "Type of quote content"
+                                    },
+                                    "context": {
+                                        "type": "string",
+                                        "description": "Brief context about why this quote is relevant"
+                                    }
+                                },
+                                "required": ["quote", "relevance_score", "quote_type", "context"]
+                            },
+                            "maxItems": 2,
+                            "description": "1-2 most relevant quotes from this source"
+                        }
+                    },
+                    "required": ["extracted_quotes"]
+                }
+            }
+        }
+
+    async def extract_key_quotes_for_subtopic(
+        self, 
+        subtopic: str, 
+        sources_for_subtopic: Dict, 
+        original_query: str
+    ) -> List[Dict]:
+        """Extract 3-5 relevant quotes for the subtopic using structured output"""
+        
+        all_quotes = []
+        
+        # Get content cache for full content
+        state = self.get_state()
+        content_cache = state.get("content_cache", {})
+        
+        for url, source_data in sources_for_subtopic.items():
+            local_id = source_data["local_id"]
+            title = source_data["title"]
+            
+            # Get content excerpt - try full content first, then preview
+            content_excerpt = ""
+            if url in content_cache and isinstance(content_cache[url], dict):
+                cached_content = content_cache[url].get("content", "")
+                if cached_content:
+                    content_excerpt = cached_content[:1500]  # Larger excerpt for quote extraction
+            
+            if not content_excerpt:
+                content_excerpt = source_data.get("content_preview", "")[:800]
+            
+            if not content_excerpt:
+                continue
+            
+            extraction_prompt = {
+                "role": "system",
+                "content": f"""You are extracting key quotes for the subtopic "{subtopic}".
+
+                From the provided source content, identify 1-2 SHORT, FACTUAL quotes (15-50 words each) that directly relate to this subtopic.
+                
+                Requirements:
+                - Quotes must be EXACT text from the source
+                - Focus on statistics, findings, expert statements, definitions, or concrete examples
+                - Each quote must be highly relevant to "{subtopic}"
+                - Assign relevance scores based on how directly the quote addresses the subtopic
+                - Provide context explaining why each quote is relevant
+                
+                You must respond with valid JSON conforming to the provided schema."""
+            }
+                
+            context = f"""Source [{local_id}]: {title}
+            
+            Content excerpt:
+            {content_excerpt}
+            
+            Extract the most relevant quotes about "{subtopic}" from this source content."""
+            
+            try:
+                # Use structured output to guarantee valid JSON
+                response = await self.generate_structured_completion(
+                    self.get_research_model(),
+                    [extraction_prompt, {"role": "user", "content": context}],
+                    response_format=self.create_quote_extraction_schema(),
+                    temperature=0.3
+                )
+                
+                if not response or "choices" not in response or not response["choices"]:
+                    logger.warning(f"No response from quote extraction for source {local_id}")
+                    continue
+                    
+                content = response["choices"][0]["message"]["content"]
+                
+                # Parse the structured JSON response
+                import json
+                quote_data = json.loads(content)
+                extracted_quotes = quote_data.get("extracted_quotes", [])
+                
+                # Add source metadata to each quote
+                for quote in extracted_quotes:
+                    quote["source_id"] = local_id
+                    quote["url"] = url
+                    quote["title"] = title
+                    all_quotes.append(quote)
+                    
+                logger.info(f"Extracted {len(extracted_quotes)} quotes from source {local_id}")
+                    
+            except Exception as e:
+                logger.error(f"Error extracting quotes from source {local_id}: {e}")
+                continue
+        
+        # Sort by relevance and return top 5
+        if all_quotes:
+            selected_quotes = self.rank_quotes_by_relevance(all_quotes, subtopic)
+        else:
+            selected_quotes = []
+        
+        logger.info(f"Selected {len(selected_quotes)} total quotes for subtopic '{subtopic}'")
+        return selected_quotes
+        
+        logger.info(f"Selected {len(selected_quotes)} total quotes for subtopic '{subtopic}'")
+        return selected_quotes
+        
+        
+    async def generate_quote_based_content(
+        self, 
+        subtopic: str, 
+        quotes: List[Dict], 
+        section_title: str, 
+        original_query: str,
+        synthesis_model: str,
+        length_guidance: str
+    ) -> str:
+        """Generate content by weaving quotes together with analysis"""
+        
+        synthesis_prompt = {
+            "role": "system",
+            "content": f"""Write about "{subtopic}" using the provided quotes as foundation.
+
+            CRITICAL RULES:
+            1. Use quotes EXACTLY as provided (don't modify)
+            2. Place citation [X] immediately after each quote
+            3. Add context and analysis around quotes
+            4. Create flowing paragraphs that connect the quotes logically
+            5. Build from quote to quote, don't just list them
+            6. Length target: {length_guidance}
+
+            STRUCTURE:
+            - Introduce the topic briefly
+            - Present first quote with context: "Research shows that... 'quote text' [X]. This indicates..."
+            - Connect to next quote: "Furthermore, studies have found that... 'quote text' [Y]..."
+            - Analyze the collective findings
+
+            Focus on "{subtopic}" within the context of "{section_title}".
+            This is for a comprehensive research report addressing: "{original_query}"."""
+        }
+        
+        # Build context with quotes
+        quote_context = f"Write about {subtopic} using these quotes:\n\n"
+        
+        for quote in quotes:
+            quote_context += f'[{quote["source_id"]}] "{quote["quote"]}" (from {quote["title"]})\n'
+        
+        quote_context += f"\nCreate flowing, analytical content that incorporates these quotes naturally with proper citations."
+        
+        try:
+            response = await self.generate_completion(
+                synthesis_model,
+                [synthesis_prompt, {"role": "user", "content": quote_context}],
+                temperature=getattr(self.valves, 'SYNTHESIS_TEMPERATURE', 0.7)
+            )
+            
+            if response and "choices" in response and len(response["choices"]) > 0:
+                return response["choices"][0]["message"]["content"]
+            else:
+                logger.error("No valid response from quote-based content generation")
+                return f"Error generating quote-based content for {subtopic}"
+            
+        except Exception as e:
+            logger.error(f"Error generating quote-based content: {e}")
+            return f"Error generating content for {subtopic}"
+
+    def rank_quotes_by_relevance(self, quotes: List[Dict], subtopic: str) -> List[Dict]:
+        """Rank quotes by relevance to subtopic, ensuring diversity"""
+        
+        # Sort by relevance score first
+        sorted_quotes = sorted(quotes, key=lambda x: x.get("relevance_score", 0), reverse=True)
+        
+        # Ensure we don't have too many quotes from the same source
+        final_quotes = []
+        source_count = {}
+        
+        for quote in sorted_quotes:
+            source_id = quote["source_id"]
+            
+            # Limit to 2 quotes per source
+            if source_count.get(source_id, 0) < 2:
+                final_quotes.append(quote)
+                source_count[source_id] = source_count.get(source_id, 0) + 1
+                
+            # Stop at 5 quotes total
+            if len(final_quotes) >= 5:
+                break
+        
+        logger.info(f"Ranked quotes for '{subtopic}': selected {len(final_quotes)} from {len(quotes)} total")
+        return final_quotes
+        
+        
+        
+    async def generate_quote_based_subtopic(self, subtopic: str, quotes: List[Dict]) -> str:
+        """Generate subtopic content by weaving together quotes with transitions"""
+        
+        synthesis_prompt = {
+            "role": "system", 
+            "content": f"""You are writing about "{subtopic}" using provided quotes as building blocks.
+
+            TASK: Create flowing, coherent paragraphs that incorporate these quotes naturally.
+            
+            RULES:
+            1. Use quotes EXACTLY as provided (don't modify them)
+            2. Add transitions and context around quotes  
+            3. Each quote should flow naturally in the text
+            4. Don't repeat information between quotes
+            5. Build a logical argument/narrative using the quotes
+
+            STRUCTURE each paragraph like:
+            [Context/intro sentence]. "Quote text" [X]. [Analysis/transition to next point].
+            """
+        }
+        
+        # Build context with all quotes
+        quote_context = f"Quotes to incorporate for {subtopic}:\n\n"
+        for i, quote in enumerate(quotes):
+            quote_context += f'[{quote["source_id"]}] "{quote["quote"]}"\n'
+            quote_context += f"Relevance: {quote['relevance']}\n\n"
+        
+        # Generate flowing content that incorporates these quotes
+        response = await self.generate_completion(synthesis_model, [synthesis_prompt, {"role": "user", "content": quote_context}])
+        return response["choices"][0]["message"]["content"]
+        
     async def generate_group_title(self, topics: List[str], user_message: str) -> str:
         """Generate a descriptive title for a group of related topics"""
         if not topics:
@@ -7586,6 +8172,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         
         logger.info(f"Starting subtopic '{subtopic}' with {len(master_source_table)} available sources")
         
+        
+        
         # Status tracking
         if not hasattr(self, "_seen_subtopics"):
             self._seen_subtopics = set()
@@ -7699,23 +8287,65 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # GENERATE CONTENT
         # =================================================================
         
-        messages = [subtopic_prompt, {"role": "user", "content": subtopic_context}]
-
+# =================================================================
+        # PHASE 1: EXTRACT KEY QUOTES (NEW)
+        # =================================================================
+        
+        logger.info(f"🔍 Extracting key quotes for subtopic '{subtopic}' from {len(sources_for_subtopic)} sources")
+        
         try:
-            response = await self.generate_completion(
-                synthesis_model,
-                messages,
-                stream=False,
-                temperature=self.valves.TEMPERATURE,
+            key_quotes = await self.extract_key_quotes_for_subtopic(
+                subtopic, sources_for_subtopic, original_query
             )
-
-            if response and "choices" in response and len(response["choices"]) > 0:
-                subtopic_content = response["choices"][0]["message"]["content"]
+            logger.info(f"✅ Extracted {len(key_quotes)} quotes for subtopic '{subtopic}'")
+            
+            # Log the quotes for debugging
+            for i, quote in enumerate(key_quotes):
+                logger.info(f"Quote {i+1}: [{quote['source_id']}] \"{quote['quote'][:50]}...\" (score: {quote.get('relevance_score', 0):.2f})")
                 
+        except Exception as e:
+            logger.error(f"❌ Error extracting quotes for subtopic '{subtopic}': {e}")
+            key_quotes = []
+        
+        # =================================================================
+        # PHASE 2: GENERATE CONTENT AROUND QUOTES (REPLACES CURRENT LOGIC)
+        # =================================================================
+        
+        try:
+            if key_quotes and len(key_quotes) > 0:
+                logger.info(f"📝 Using quote-based generation for subtopic '{subtopic}' with {len(key_quotes)} quotes")
+                subtopic_content = await self.generate_quote_based_content(
+                    subtopic=subtopic,
+                    quotes=key_quotes,
+                    section_title=section_title,
+                    original_query=original_query,
+                    synthesis_model=synthesis_model,
+                    length_guidance=length_guidance
+                )
+                generation_method = "quote-based"
+            else:
+                logger.info(f"📄 No quotes found, using traditional generation for subtopic '{subtopic}'")
+                # Fallback to current method if no quotes extracted
+                messages = [subtopic_prompt, {"role": "user", "content": subtopic_context}]
+                response = await self.generate_completion(
+                    synthesis_model,
+                    messages,
+                    stream=False,
+                    temperature=self.valves.TEMPERATURE,
+                )
+                
+                if response and "choices" in response and len(response["choices"]) > 0:
+                    subtopic_content = response["choices"][0]["message"]["content"]
+                    generation_method = "traditional"
+                else:
+                    raise Exception("No response from traditional generation")
+
+            if subtopic_content:
                 # DEBUG: Check what citations are in the generated content
                 import re
                 citations_in_content = re.findall(r'\[(\d+)\]', subtopic_content)
-                logger.info(f"CITATIONS DEBUG - Subtopic '{subtopic}' generated citations: {citations_in_content}")
+                logger.info(f"🔗 CITATIONS DEBUG - Subtopic '{subtopic}' generated citations: {citations_in_content}")
+                logger.info(f"📊 Generation method: {generation_method}")
 
                 tokens = await self.count_tokens(subtopic_content)
 
@@ -7738,18 +8368,20 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     except ValueError:
                         continue
 
-                logger.info(f"Subtopic '{subtopic}' actually used {len(used_citations)} citations")
+                logger.info(f"✅ Subtopic '{subtopic}' successfully used {len(used_citations)} citations")
 
                 return {
                     "content": subtopic_content,
                     "tokens": tokens,
                     "sources": sources_for_subtopic,
-                    "used_citations": used_citations,  # NEW: Track actually used citations
+                    "used_citations": used_citations,
                     "verified_citations": [],
                     "flagged_citations": [],
+                    "quotes_used": key_quotes if key_quotes else [],
+                    "generation_method": generation_method,
                 }
             else:
-                logger.error(f"Failed to generate content for subtopic: {subtopic}")
+                logger.error(f"❌ Failed to generate content for subtopic: {subtopic}")
                 return {
                     "content": f"*Error generating content for subtopic: {subtopic}*",
                     "tokens": 0,
@@ -7757,10 +8389,12 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     "used_citations": [],
                     "verified_citations": [],
                     "flagged_citations": [],
+                    "quotes_used": [],
+                    "generation_method": "error",
                 }
 
         except Exception as e:
-            logger.error(f"Error generating subtopic content for '{subtopic}': {e}")
+            logger.error(f"❌ Error in content generation for subtopic '{subtopic}': {e}")
             return {
                 "content": f"*Error generating content for subtopic: {subtopic}*",
                 "tokens": 0,
@@ -7768,7 +8402,13 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 "used_citations": [],
                 "verified_citations": [],
                 "flagged_citations": [],
+                "quotes_used": [],
+                "generation_method": "error",
             }
+
+
+
+
     def safe_citation_replacement(self, content, replacement_map):
         """Replace citations with debug logging"""
         logger.info(f"=== CITATION REPLACEMENT DEBUG ===")
@@ -8477,7 +9117,436 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         self.update_state("verification_results", verification_results)
 
         return verification_results
+    async def execute_search_queries(self, queries, outline_embedding=None, summary_embedding=None):
+        """Execute a list of search queries and return results - OPTIMIZED VERSION"""
+        import asyncio
+        
+        results = []
+        session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Step 1: Get all embeddings in parallel
+        embedding_tasks = []
+        for query in queries:
+            embedding_tasks.append(self.get_embedding_safe(query))
+        
+        query_embeddings = await asyncio.gather(*embedding_tasks, return_exceptions=True)
+        
+        # Step 2: Process all queries in parallel
+        search_tasks = []
+        for i, query in enumerate(queries):
+            # Handle embedding errors
+            query_embedding = query_embeddings[i]
+            if isinstance(query_embedding, Exception):
+                logger.warning(f"Failed to get embedding for '{query}', using default")
+                query_embedding = [0] * 384
+            
+            # Create task for this query
+            search_tasks.append(
+                self.process_single_query_optimized(query, query_embedding, outline_embedding, summary_embedding)
+            )
+        
+        # Execute all searches in parallel
+        all_query_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+        
+        # Step 3: Collect and flatten results
+        for i, query_results in enumerate(all_query_results):
+            if isinstance(query_results, Exception):
+                logger.error(f"Error processing query '{queries[i]}': {query_results}")
+                await self.emit_message(f"*Error processing query: {queries[i]}*\n")
+            else:
+                results.extend(query_results)
+        
+        logger.info(f"Total results from all queries: {len(results)}")
+        return results
 
+    async def get_embedding_safe(self, query):
+        """Safe wrapper for get_embedding with error handling"""
+        try:
+            await self.emit_status("info", f"Getting embedding for query: {query}", False)
+            return await self.get_embedding(query)
+        except Exception as e:
+            logger.error(f"Error getting embedding for '{query}': {e}")
+            raise e
+
+    async def process_single_query_optimized(self, query, query_embedding, outline_embedding, summary_embedding):
+        """Process a single query (local + web search if needed)"""
+        local_results = []
+        
+        # Search local knowledge base
+        if self.valves.USE_KNOWLEDGE_BASE and hasattr(self, 'knowledge_base') and self.knowledge_base:
+            try:
+                local_results = await self.knowledge_base.search_local(query, n_results=5)
+                if local_results:
+                    await self.emit_message(f"*Found {len(local_results)} relevant sources in local knowledge base for: {query}*\n")
+                    
+                    # Batch process local results
+                    for local_result in local_results:
+                        local_result['query'] = query
+                        local_result['valid'] = True
+                        if 'tokens' not in local_result:
+                            local_result['tokens'] = await self.count_tokens(local_result['content'])
+                            
+            except Exception as e:
+                logger.error(f"Knowledge base error for query '{query}': {e}")
+                await self.emit_message(f"*Knowledge base temporarily unavailable for: {query}*\n")
+        
+        # Determine if web search is needed
+        if len(local_results) >= 2:
+            await self.emit_message(f"*Using local sources, skipping web search for: {query}*\n")
+            return local_results
+        
+        # Perform web search
+        web_results = []
+        try:
+            if self.valves.ACADEMIC_PRIORITY:
+                web_results = await self.search_with_academic_priority_forced(
+                    query, self.valves.SEARCH_RESULTS_PER_QUERY + 2
+                )
+                
+                # Batch process academic results
+                processed_web_results = []
+                for result in web_results:
+                    try:
+                        if result.get("source") in ["PubMed", "HAL", "SUDOC", "arXiv", "CrossRef", "PEPITE"]:
+                            result.setdefault('query', query)
+                            result.setdefault('valid', True)
+                            processed_web_results.append(result)
+                            await self.display_academic_result(result)
+                        else:
+                            processed_result = await self.process_search_result(
+                                result, query, query_embedding, outline_embedding, summary_embedding
+                            )
+                            if processed_result.get("valid", False):
+                                processed_web_results.append(processed_result)
+                    except Exception as e:
+                        logger.error(f"Error processing web result for query '{query}': {e}")
+                        continue
+                
+                web_results = processed_web_results
+            else:
+                web_results = await self.process_query(
+                    query, query_embedding, outline_embedding, None, summary_embedding
+                )
+            
+            logger.info(f"Added {len(web_results)} web results for query: {query}")
+            
+        except Exception as e:
+            logger.error(f"Error in web search for query '{query}': {e}")
+            await self.emit_message(f"*Error in web search for: {query}*\n")
+        
+        return local_results + web_results
+    async def generate_search_queries(self, user_message, context_type="initial", previous_summary="", query_count=8):
+        """Generate search queries based on context type"""
+        if context_type == "initial":
+            prompt_content = f"""You are a post-grad research assistant generating effective search queries.
+The user has submitted a research query: "{user_message}".
+Based on the user's input, generate {query_count} initial search queries to begin research and help us delineate the research topic.
+Half of the queries should be broad, aimed at identifying and defining the main topic and returning core characteristic information about it.
+The other half should be more specific, designed to find information to help expand on known base details of the user's query.
+Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
+
+Format your response as a valid JSON object with the following structure:
+{{"queries": [
+  "search query 1", 
+  "search query 2",
+  "search query 3..."
+]}}"""
+            user_content = f"Generate initial search queries for this user query: {user_message}"
+            
+        elif context_type == "followup":
+            prompt_content = """You are a post-grad research assistant generating effective search queries for continued research based on an existing report.
+Based on the user's follow-up question and the previous research summary, generate 6 initial search queries.
+Each query should be specific, use relevant keywords, and be designed to find new information that builds on the previous research towards the new query.
+Use quotes sparingly and as a last resort. Never use multiple sets of quotes in the same query.
+
+Format your response as a valid JSON object with the following structure:
+{"queries": [
+  "search query 1", 
+  "search query 2",
+  "search query 3"
+]}"""
+            user_content = f"Follow-up question: {user_message}\n\nPrevious research summary:\n{previous_summary}...\n\nGenerate initial search queries for the follow-up question that build on the previous research."
+
+        # Generate queries
+        query_messages = [
+            {"role": "system", "content": prompt_content},
+            {"role": "user", "content": user_content}
+        ]
+        
+        query_response = await self.generate_completion(
+            self.get_research_model(),
+            query_messages,
+            temperature=self.valves.TEMPERATURE,
+        )
+        query_content = query_response["choices"][0]["message"]["content"]
+
+        # Extract JSON from response
+        try:
+            query_json_str = query_content[query_content.find("{"): query_content.rfind("}") + 1]
+            query_data = json.loads(query_json_str)
+            queries = query_data.get("queries", [])
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error(f"Error parsing query JSON: {e}")
+            # Fallback: extract queries using regex if JSON parsing fails
+            import re
+            queries = re.findall(r'"([^"]+)"', query_content)[:query_count]
+            if not queries:
+                queries = ["Information about " + user_message]
+        
+        return queries
+
+    async def generate_research_outline_with_context(self, user_message, context_type="initial", initial_results=None, previous_summary=""):
+        """Generate research outline based on context"""
+        if context_type == "followup":
+            prompt_content = """You are a post-grad research assistant creating a structured research outline.
+Based on the user's follow-up question, previous research summary, and new search results, create a comprehensive outline 
+that builds on the previous research while addressing the new aspects from the follow-up question.
+
+The outline should:
+1. Include relevant topics from the previous research that provide context
+2. Add new topics that specifically address the follow-up question
+3. Be organized in a hierarchical structure with main topics and subtopics
+4. Focus on aspects that weren't covered in depth in the previous research
+
+Format your response as a valid JSON object with the following structure:
+{"outline": [
+  {"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]},
+  {"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}
+]}"""
+            
+            # Build context from initial search results and previous summary
+            outline_context = f"### Previous Research Summary:\n\n{previous_summary}...\n\n"
+            outline_context += "### New Search Results:\n\n"
+            for i, result in enumerate(initial_results or []):
+                outline_context += f"Result {i + 1} (Query: '{result['query']}')\n"
+                outline_context += f"Title: {result['title']}\n"
+                outline_context += f"Content: {result['content']}...\n\n"
+            
+            user_content = f"Follow-up question: {user_message}\n\n{outline_context}\n\nGenerate a comprehensive research outline that builds on previous research while addressing the follow-up question."
+            
+        else:  # initial
+            prompt_content = f"""You are a post-graduate academic scholar tasked with creating a structured research outline.
+Based on the user's query and the initial search results, create a comprehensive conceptual outline of additional information 
+needed to completely and thoroughly address the user's original query: "{user_message}".
+
+The outline must:
+1. Break down the query into key concepts that need to be researched and key details about important figures, details, methods, etc.
+2. Be organized in a hierarchical structure, with main topics directly relevant to addressing the query, and subtopics to flesh out main topics.
+3. Include topics discovered in the initial search results relevant to addressing the user's input, while ignoring overly-specific or unrelated topics.
+
+The outline MUST NOT:
+1. Delve into philosophical or theoretical approaches, unless clearly appropriate to the subject or explicitly solicited by the user.
+2. Include generic topics or subtopics, i.e. "considering complexities" or "understanding the question".
+3. Reflect your own opinions, bias, notions, priorities, or other non-academic impressions of the area of research.
+
+Your outline should conceptually take up the entire space between an introduction and conclusion, filling in the entirety of the research volume.
+Do NOT allow rendering artifacts, web site UI features, HTML/CSS/underlying website build language, or any other irrelevant text to distract you from your goal.
+Don't add an appendix topic, nor an explicit introduction or conclusion topic. ONLY include the outline in your response.
+
+Format your response as a valid JSON object with the following structure:
+{{"outline": [
+  {{"topic": "Main topic 1", "subtopics": ["Subtopic 1.1", "Subtopic 1.2"]}},
+  {{"topic": "Main topic 2", "subtopics": ["Subtopic 2.1", "Subtopic 2.2"]}}
+]}}"""
+            
+            # Build context from initial search results
+            outline_context = "### Initial Search Results:\n\n"
+            for i, result in enumerate(initial_results or []):
+                outline_context += f"Result {i + 1} (Query: '{result['query']}')\n"
+                outline_context += f"Title: {result['title']}\n"
+                outline_context += f"Content: {result['content']}...\n\n"
+            
+            user_content = f"User query: {user_message}\n\n{outline_context}\n\nGenerate a comprehensive research outline based on the query and search results."
+
+        return await self.generate_research_outline_with_retry(user_message, user_content)
+
+    async def process_research_pipeline(self, user_message, messages):
+        """Main research pipeline that handles both initial and follow-up queries"""
+        state = self.get_state()
+        
+        # Handle outline feedback if waiting
+        if state.get("waiting_for_outline_feedback", False):
+            return await self.handle_outline_feedback(user_message)
+        
+        # Determine if this is a follow-up query
+        is_follow_up = await self.is_follow_up_query(messages)
+        self.update_state("follow_up_mode", is_follow_up)
+        
+        # Get summary embedding for follow-up queries
+        summary_embedding = None
+        if is_follow_up:
+            summary_embedding = await self.setup_followup_mode(state)
+            if summary_embedding is None:
+                is_follow_up = False
+                self.update_state("follow_up_mode", False)
+        
+        # Initialize mode-specific variables
+        if not is_follow_up:
+            await self.emit_status("info", "Starting deep research...", False)
+            await self.emit_message("## Deep Research Mode: Activated\n\n")
+            await self.emit_message("I'll search for comprehensive information about your query. This might take a moment...\n\n")
+        
+        # Check for existing research state from feedback
+        research_state = state.get("research_state")
+        if research_state:
+            return await self.continue_from_research_state(research_state, user_message)
+        
+        # Generate queries based on context
+        context_type = "followup" if is_follow_up else "initial"
+        query_count = 6 if is_follow_up else 8
+        previous_summary = state.get('prev_comprehensive_summary', '') if is_follow_up else ""
+        
+        await self.emit_status("info", f"Generating {'follow-up' if is_follow_up else 'initial'} search queries...", False)
+        
+        queries = await self.generate_search_queries(
+            user_message, context_type, previous_summary, query_count
+        )
+        
+        # Display queries
+        query_title = "Initial Follow-up Research Queries" if is_follow_up else "Initial Research Queries"
+        await self.emit_message(f"### {query_title}\n\n")
+        for i, query in enumerate(queries):
+            await self.emit_message(f"**Query {i + 1}**: {query}\n\n")
+        
+        # Execute searches
+        outline_embedding = await self.get_embedding(user_message)  # Placeholder
+        initial_results = await self.execute_search_queries(queries, outline_embedding, summary_embedding)
+        
+        # Validate results
+        useful_results = [r for r in initial_results if len(r.get("content", "")) > 200]
+        if not useful_results:
+            await self.emit_message("*Unable to find initial search results. Creating research outline based on the query alone.*\n\n")
+            initial_results = [{
+                "title": f"Information about {user_message}",
+                "url": "",
+                "content": f"This is a placeholder for research about {user_message}. The search failed to return usable results.",
+                "query": user_message,
+            }]
+        else:
+            logger.info(f"Found {len(useful_results)} useful results from initial queries")
+        
+        # Generate research outline
+        await self.emit_status("info", f"Generating research outline{'for follow-up' if is_follow_up else ''}...", False)
+        
+        research_outline = await self.generate_research_outline_with_context(
+            user_message, context_type, initial_results, previous_summary
+        )
+        
+        # Process outline and continue research
+        all_topics = []
+        for topic_item in research_outline:
+            all_topics.append(topic_item["topic"])
+            all_topics.extend(topic_item.get("subtopics", []))
+        
+        # Create outline embedding
+        outline_text = " ".join(all_topics)
+        outline_embedding = await self.get_embedding(outline_text)
+        
+        # Initialize research dimensions
+        await self.initialize_research_dimensions(all_topics, user_message)
+        
+        # Display the outline
+        outline_title = "Research Outline for Follow-up" if is_follow_up else "Research Outline"
+        outline_display = f"### {outline_title}\n\n"
+        for topic in research_outline:
+            outline_display += f"**{topic['topic']}**\n"
+            for subtopic in topic.get("subtopics", []):
+                outline_display += f"- {subtopic}\n"
+            outline_display += "\n"
+        
+        await self.emit_message(outline_display)
+        follow_up_msg = "previous findings" if is_follow_up else "this outline"
+        await self.emit_message(f"\n*Continuing with research based on {follow_up_msg}...*\n\n")
+        
+        # Initialize research state
+        await self.initialize_research_state(user_message, research_outline, all_topics, outline_embedding)
+        await self.update_token_counts()
+        
+        return initial_results
+
+    async def setup_followup_mode(self, state):
+        """Setup follow-up mode and return summary embedding"""
+        prev_comprehensive_summary = state.get("prev_comprehensive_summary", "")
+        if prev_comprehensive_summary:
+            try:
+                await self.emit_status("info", "Processing follow-up query...", False)
+                summary_embedding = await self.get_embedding(prev_comprehensive_summary)
+                await self.emit_message("## Deep Research Mode: Follow-up\n\n")
+                await self.emit_message("I'll continue researching based on your follow-up query while considering our previous findings.\n\n")
+                return summary_embedding
+            except Exception as e:
+                logger.error(f"Error getting summary embedding: {e}")
+                return None
+        return None
+
+    async def handle_outline_feedback(self, user_message):
+        """Handle outline feedback processing"""
+        state = self.get_state()
+        feedback_data = state.get("outline_feedback_data", {})
+        
+        if feedback_data:
+            # Process the user's feedback
+            self.update_state("waiting_for_outline_feedback", False)
+            feedback_result = await self.process_outline_feedback_continuation(user_message)
+            
+            # Get the research state parameters directly from feedback data
+            original_query = feedback_data.get("original_query", "")
+            outline_items = feedback_data.get("outline_items", [])
+            
+            # Retrieve all_topics and outline_embedding
+            all_topics = []
+            for topic_item in outline_items:
+                all_topics.append(topic_item["topic"])
+                all_topics.extend(topic_item.get("subtopics", []))
+            
+            # Update outline embedding based on all_topics
+            outline_text = " ".join(all_topics)
+            outline_embedding = await self.get_embedding(outline_text)
+            
+            # Continue the research process from the outline feedback
+            research_outline, all_topics, outline_embedding = await self.continue_research_after_feedback(
+                feedback_result, original_query, outline_items, all_topics, outline_embedding
+            )
+            
+            # Initialize research state consistently
+            await self.initialize_research_state(original_query, research_outline, all_topics, outline_embedding)
+            await self.update_token_counts()
+            
+            return []  # Return empty initial_results since we're continuing from feedback
+        else:
+            # Recovery from error state
+            self.update_state("waiting_for_outline_feedback", False)
+            logger.warning("Waiting for outline feedback but no data available")
+            return None
+
+    async def continue_from_research_state(self, research_state, user_message):
+        """Continue research from existing research state"""
+        research_outline = research_state.get("research_outline", [])
+        all_topics = research_state.get("all_topics", [])
+        outline_embedding = research_state.get("outline_embedding")
+        user_message = research_state.get("user_message", user_message)
+        
+        await self.emit_status("info", "Continuing research with updated outline...", False)
+        return []  # Return empty initial_results since we're continuing from existing state
+
+    # Main entry point - replace your existing pipeline logic with this single call:
+    async def run_main_research_pipeline(self, user_message, messages):
+        """Main entry point for the research pipeline"""
+        try:
+            initial_results = await self.process_research_pipeline(user_message, messages)
+            
+            
+            
+            # Continue with research cycles if we have results
+            if initial_results is not None:
+                # Your existing research cycle logic goes here
+                # (the part that comes after outline generation)
+                pass
+                
+        except Exception as e:
+            logger.error(f"Error in research pipeline: {e}")
+            await self.emit_message(f"An error occurred during research: {str(e)}")
+            raise
     async def export_research_data(self) -> Dict:
         """Export research data into two files: clean report and detailed sources"""
         import os
@@ -9003,6 +10072,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             for i in range(num_replacements)
         ]
 
+
+
     async def improved_query_generation(
             self, user_message, priority_topics, search_context
     ):
@@ -9276,6 +10347,409 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         logger.info(f"=== CITATION SOURCES DEBUG END ===")
 
 
+    async def unload_model(self, model_name: str):
+        """Unload a model to free memory (LMStudio/Ollama compatible)"""
+        try:
+            # For LMStudio, you might need to call a specific endpoint
+            # This is a placeholder - adjust based on your setup
+            connector = aiohttp.TCPConnector(force_close=True)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                # Try LMStudio unload endpoint (if available)
+                try:
+                    payload = {"model": model_name}
+                    async with session.post(
+                        f"{self.valves.OLLAMA_URL}/v1/models/unload", 
+                        json=payload, 
+                        timeout=10
+                    ) as response:
+                        if response.status == 200:
+                            logger.info(f"Successfully unloaded model: {model_name}")
+                            return True
+                except:
+                    pass
+                
+                # Try Ollama unload endpoint
+                try:
+                    async with session.delete(
+                        f"{self.valves.OLLAMA_URL}/api/generate",
+                        json={"model": model_name, "keep_alive": 0},
+                        timeout=10
+                    ) as response:
+                        logger.info(f"Attempted to unload model: {model_name}")
+                        return True
+                except:
+                    pass
+            
+            logger.warning(f"Could not unload model {model_name} - endpoint not available")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error unloading model {model_name}: {e}")
+            return False
+    async def detect_query_language(self, user_message: str) -> str:
+        """Detect the language of the original query"""
+        try:
+            # Simple language detection based on common words and patterns
+            text_lower = user_message.lower()
+            
+            # French indicators
+            french_indicators = [
+                'le ', 'la ', 'les ', 'un ', 'une ', 'des ', 'du ', 'de la ', 
+                'est ', 'sont ', 'avec ', 'dans ', 'pour ', 'sur ', 'comment ', 
+                'pourquoi ', 'quand ', 'où ', 'que ', 'qui ', 'quoi '
+            ]
+            
+            # Spanish indicators  
+            spanish_indicators = [
+                'el ', 'la ', 'los ', 'las ', 'un ', 'una ', 'es ', 'son ', 
+                'con ', 'en ', 'para ', 'por ', 'como ', 'por qué ', 'cuando ', 
+                'donde ', 'que ', 'quien '
+            ]
+            
+            # German indicators
+            german_indicators = [
+                'der ', 'die ', 'das ', 'ein ', 'eine ', 'ist ', 'sind ', 
+                'mit ', 'in ', 'für ', 'auf ', 'wie ', 'warum ', 'wann ', 
+                'wo ', 'was ', 'wer '
+            ]
+            
+            # Count indicators
+            french_count = sum(1 for indicator in french_indicators if indicator in text_lower)
+            spanish_count = sum(1 for indicator in spanish_indicators if indicator in text_lower)
+            german_count = sum(1 for indicator in german_indicators if indicator in text_lower)
+            
+            # Determine language
+            if french_count > 0 and french_count >= spanish_count and french_count >= german_count:
+                return "French"
+            elif spanish_count > 0 and spanish_count >= german_count:
+                return "Spanish"
+            elif german_count > 0:
+                return "German"
+            else:
+                return "English"  # Default
+                
+        except Exception as e:
+            logger.error(f"Error detecting language: {e}")
+            return "English"  # Safe default
+
+    async def verify_final_report(self, comprehensive_answer: str, user_message: str) -> str:
+        """Perform final verification and quality control of the complete report"""
+        
+        if not self.valves.ENABLE_FINAL_VERIFICATION:
+            return comprehensive_answer
+        
+        await self.emit_status("info", "Performing final report verification...", False)
+        
+        # Detect query language
+        detected_language = await self.detect_query_language(user_message)
+        logger.info(f"Detected query language: {detected_language}")
+        
+        # Unload research model if requested
+        if self.valves.UNLOAD_RESEARCH_MODEL:
+            await self.emit_status("info", "Unloading research model to optimize memory...", False)
+            await self.unload_model(self.valves.RESEARCH_MODEL)
+        
+        verification_prompt = {
+            "role": "system",
+            "content": f"""You are an expert research editor performing final quality control on a comprehensive research report. Your primary mission is to ensure the report is **directly relevant**, **linguistically consistent**, and **structurally sound**.
+
+    ## Critical Tasks (in order of priority):
+
+    ### 1. **Relevance Verification** (HIGHEST PRIORITY)
+    - **Analyze each subsection** against the original query and report title/abstract
+    - **Identify off-topic content** that doesn't directly address the research question
+    - **Remove irrelevant subsections** that don't support the main research question
+
+    **Decision Process:**
+    - If a subsection is **clearly unrelated** to the query: Remove it entirely
+    - If a subsection is **partially relevant**: Keep only the relevant parts
+    - If a subsection has **mixed content**: Extract and preserve only query-relevant information
+    - If **uncertain**: Keep the content but ensure it connects to the main topic
+
+    ### 2. **Structural Quality Control**
+    - **Verify proper section order and consolidate multiple bibliographies**
+    - **Remove redundant information** across sections
+    - **Fix grammatical errors** and awkward phrasing
+    - **Ensure logical flow** between sections
+
+    ## Specific Instructions:
+
+    ### **What to PRESERVE (Never Change):**
+    - ✅ ALL in-text citations [1], [2], [3], etc.
+    - ✅ ALL strikethrough text exactly as written
+    - ✅ Factual content and research findings
+    - ✅ Author names, publication titles, dates
+    - ✅ Statistical data and research results
+
+    ### **What to REMOVE/MODIFY:**
+    - ❌ Subsections clearly unrelated to the query
+    - ❌ Redundant information repeated across sections
+    - ❌ Content in wrong language
+    - ❌ Multiple bibliography sections (consolidate to one)
+    - ❌ Grammatical errors and unclear phrasing
+
+    ### **Decision Framework for Relevance:**
+    Ask yourself for each subsection:
+    1. "Does this directly address the original query?"
+    2. "Does this support understanding of the main research question?"
+    3. "Is this information essential for the reader to understand the topic?"
+
+    **If NO to questions 1-2**: The section is likely irrelevant and should be removed.
+
+    ## Quality Safeguards:
+    - **Citation Preservation**: Original citation count must be maintained (±5% tolerance)
+    - **Language Detection**: Translate inconsistent sections while preserving meaning
+    - **Structural Integrity**: Ensure logical progression and coherent narrative flow
+
+    Remember: Be decisive about relevance. If content doesn't directly serve the research question, remove it. The goal is a focused, coherent report that precisely addresses the user's query."""
+        }
+        
+        # Prepare context with original query and report
+        verification_context = f"""Original Query: "{user_message}"
+    Detected Language: {detected_language}
+
+    Complete Report to Review:
+
+    {comprehensive_answer}
+
+    Please review and improve this report according to the guidelines above. Focus especially on removing any subsections that are clearly unrelated to the original query."""
+        
+        try:
+            # Use verification model
+            verification_model = self.valves.VERIFICATION_MODEL
+            await self.emit_status("info", f"Using {verification_model} for relevance and quality verification...", False)
+            
+            response = await self.generate_completion(
+                verification_model,
+                [verification_prompt, {"role": "user", "content": verification_context}],
+                temperature=0.2,  # Lower temperature for precise editing
+            )
+            
+            if response and "choices" in response and len(response["choices"]) > 0:
+                verified_report = response["choices"][0]["message"]["content"]
+                
+                # Enhanced sanity checks
+                original_citations = len(re.findall(r'\[\d+\]', comprehensive_answer))
+                verified_citations = len(re.findall(r'\[\d+\]', verified_report))
+                
+                # Check for structural improvements
+                original_bib_count = len(re.findall(r'## Bibliography|## References', comprehensive_answer))
+                verified_bib_count = len(re.findall(r'## Bibliography|## References', verified_report))
+                
+                # Check for duplicate section titles
+                duplicate_sections = len(re.findall(r'### General Information', comprehensive_answer))
+                verified_duplicates = len(re.findall(r'### General Information', verified_report))
+                
+                # Check word count reduction (significant reduction might indicate good irrelevant content removal)
+                original_words = len(comprehensive_answer.split())
+                verified_words = len(verified_report.split())
+                reduction_ratio = (original_words - verified_words) / original_words if original_words > 0 else 0
+                
+                if verified_citations < original_citations * 0.8:  # Lost more than 20% of citations
+                    logger.warning("Verification may have removed citations, using original report")
+                    await self.emit_status("warning", "Verification removed citations - using original", False)
+                    return comprehensive_answer
+                
+                # Check for bibliography count and placement
+                if verified_bib_count == 1:
+                    # Check if bibliography is properly placed after conclusion
+                    conclusion_pos = verified_report.find('## Conclusion')
+                    bib_pos = verified_report.find('## Bibliography') or verified_report.find('## References')
+                    if conclusion_pos != -1 and bib_pos != -1 and bib_pos > conclusion_pos:
+                        logger.info("Bibliography properly placed after conclusion")
+                    else:
+                        logger.warning("Bibliography may not be properly positioned")
+                elif verified_bib_count != 1:
+                    logger.warning(f"Verification resulted in {verified_bib_count} bibliographies instead of 1")
+                
+                # Log structural improvements
+                if duplicate_sections > 1 and verified_duplicates <= 1:
+                    logger.info(f"Fixed duplicate section titles: {duplicate_sections} → {verified_duplicates}")
+                    await self.emit_status("info", "Removed duplicate section titles", False)
+                
+                # Log verification results
+                if reduction_ratio > 0.1:  # More than 10% reduction
+                    logger.info(f"Verification removed {reduction_ratio:.1%} of content (likely irrelevant sections)")
+                    await self.emit_status("info", f"Removed {reduction_ratio:.1%} of potentially irrelevant content", False)
+                
+                await self.emit_status("info", "Report verification completed successfully", False)
+                logger.info(f"Verification: {original_citations} citations preserved, {verified_bib_count} bibliography sections")
+                
+                # NEW: Reference Quality Pass - ADD THIS SECTION HERE
+                await self.emit_status("info", "Improving reference quality and source attributions...", False)
+                
+                reference_quality_prompt = {
+                    "role": "system",
+                    "content": """You are a research writing specialist focused on improving reference introductions and source attribution quality.
+
+    Your task: Review and improve how sources are introduced in the text while preserving all citations exactly.
+
+    ## Reference Style Guidelines:
+
+    ### When you HAVE author names:
+    - Use: "According to Smith et al. [X]" or "As Johnson argues [X]"
+    - Use: "Research by Martinez [X] demonstrates that..."
+
+    ### When you DON'T have author names:
+    **Match the introduction to source type:**
+    - Academic papers: "According to a study [X]" or "Research indicates [X]"
+    - Government reports: "According to government data [X]" or "Official reports show [X]"
+    - News articles: "According to news reports [X]" or "Media coverage indicates [X]"
+    - Reddit/Forums: "According to online discussions [X]" or "Community reports suggest [X]"
+    - Websites/Blogs: "According to online sources [X]" or "Web-based analysis shows [X]"
+
+    ## Critical Rules:
+    - ✅ NEVER change citation numbers [1], [2], etc.
+    - ✅ Preserve all factual content exactly
+    - ✅ Only modify the introductory phrases before quotes/citations
+    - ❌ Don't call Reddit posts "research articles"
+    - ❌ Don't call blog posts "academic studies"
+
+    ## Examples of improvements:
+    ❌ "According to a research article [X]" (when [X] is Reddit)
+    ✅ "According to online discussions [X]"
+
+    ❌ "Studies show [X]" (when no author and it's a news article)  
+    ✅ "According to news reports [X]"
+
+    Focus only on making source introductions accurate and appropriate."""
+                }
+
+                reference_context = f"""Original Query: "{user_message}"
+    Report to improve reference quality:
+    {verified_report}
+
+    Please review and improve the reference introductions to match source types appropriately."""
+
+                try:
+                    reference_response = await self.generate_completion(
+                        verification_model,
+                        [reference_quality_prompt, {"role": "user", "content": reference_context}],
+                        temperature=0.2
+                    )
+                    
+                    if reference_response and "choices" in reference_response and len(reference_response["choices"]) > 0:
+                        final_report = reference_response["choices"][0]["message"]["content"]
+                        
+                        # Quick sanity check for reference quality pass
+                        final_citations = len(re.findall(r'\[\d+\]', final_report))
+                        if final_citations < verified_citations * 0.95:  # Allow 5% tolerance
+                            logger.warning("Reference quality pass may have removed citations, using verified report")
+                            await self.emit_status("warning", "Reference quality pass removed citations - skipping", False)
+                            return verified_report
+                        
+                        await self.emit_status("info", "Reference quality improvement completed", False)
+                        return final_report
+                    else:
+                        logger.warning("Reference quality pass failed, using verified report")
+                        return verified_report
+                        
+                except Exception as e:
+                    logger.error(f"Error during reference quality pass: {e}")
+                    await self.emit_status("warning", "Reference quality pass failed - using verified report", False)
+                    return verified_report
+                
+            else:
+                logger.error("Verification model returned no response")
+                await self.emit_status("warning", "Verification failed - using original report", False)
+                return comprehensive_answer
+                
+        except Exception as e:
+            logger.error(f"Error during report verification: {e}")
+            await self.emit_status("warning", f"Verification error - using original report", False)
+            return comprehensive_answer
+
+    async def generate_research_outline_with_retry(self, user_message, outline_context, max_retries=3, model="your-model"):
+        """Generate a structured research outline using LMStudio's structured output"""
+        
+        """Generate research outline with robust error handling and structured output"""
+        
+        for attempt in range(max_retries):
+            logger.info(f"=== STRUCTURED OUTLINE GENERATION ATTEMPT {attempt + 1}/{max_retries} ===")
+            
+            # Build the system message based on attempt
+            if attempt == 0:
+                system_message = """You are a post-grad research assistant creating a structured research outline.
+Based on the user's follow-up question, previous research summary, and new search results, create a comprehensive outline 
+that builds on the previous research while addressing the new aspects from the follow-up question.
+
+The outline should:
+1. Include relevant topics from the previous research that provide context
+2. Add new topics that specifically address the follow-up question
+3. Be organized in a hierarchical structure with main topics and subtopics
+4. Focus on aspects that weren't covered in depth in the previous research
+
+You must respond with valid JSON conforming to the provided schema."""
+            else:
+                # Simplified system message for retries
+                system_message = """You are a research assistant. Create a structured research outline based on the user's query and context.
+Focus on creating logical, well-structured sections with clear subsections and research questions."""
+            
+            # Build user message with context
+            # Build user message with context
+            user_content = f"Follow-up question: {user_message}\n\n{outline_context}\n\nGenerate a comprehensive research outline."
+
+            # Truncate context if it's too long for later attempts
+            context_to_use = outline_context
+            if attempt > 0 and len(outline_context) > 2000:  # <-- Fixed indentation (same level as user_content line)
+                context_to_use = outline_context[:2000] + "...\n[Content truncated for retry]"
+                logger.debug(f"Truncated context to {len(context_to_use)} characters for attempt {attempt + 1}")
+                # Rebuild user_content with truncated context
+                user_content = f"Follow-up question: {user_message}\n\n{context_to_use}\n\nGenerate a comprehensive research outline."
+
+            messages = [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_content}  # <-- Fixed: use user_content, not user_message
+            ]
+
+            try:
+                logger.info(f"🔄 Generating structured research outline for: {user_message}")
+                
+                # Use structured output with a dedicated method
+                response = await self.generate_structured_completion(
+                    model,
+                    messages,
+                    response_format=self.create_research_outline_schema(),
+                    temperature=0.3
+                )
+                
+                if not response or "choices" not in response:
+                    logger.error(f"Attempt {attempt + 1}: Invalid response structure")
+                    continue
+                if not response["choices"] or len(response["choices"]) == 0:
+                    logger.error(f"Attempt {attempt + 1}: No choices in response")
+                    continue
+                
+                outline_content = response["choices"][0]["message"]["content"]
+                
+                if not outline_content or len(outline_content.strip()) == 0:
+                    logger.error(f"Attempt {attempt + 1}: Empty content returned")
+                    continue
+                
+                # Parse the structured JSON response
+                try:
+                    outline_json = json.loads(outline_content)
+                    logger.info("✅ Successfully generated structured research outline")
+                    
+                    # Convert to the format expected by your existing code
+                    research_outline = self.convert_to_legacy_format(outline_json)
+                    return research_outline
+                    
+                except json.JSONDecodeError as e:
+                    logger.error(f"❌ JSON parsing error on attempt {attempt + 1}: {e}")
+                    # This should be rare with structured output, but continue to next attempt
+                    continue
+                    
+            except Exception as e:
+                logger.error(f"❌ Error generating outline on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                continue
+        
+        # All attempts failed - create fallback outline
+        logger.error("All structured outline generation attempts failed, creating fallback outline")
+        return self.create_legacy_fallback_outline(user_message)
+
 
 
     def renumber_citations_in_content(self, content):
@@ -9349,6 +10823,11 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
         # If the pipe is disabled or it's not a default task, return
         if not self.valves.ENABLED:
             return ""
+
+
+        # Ensure knowledge base is initialized with default if not already done
+        if self.knowledge_base is None:
+            self.initialize_knowledge_base("research")
 
         # Get user query from the latest message
         user_message = messages[-1].get("content", "").strip()
@@ -9580,93 +11059,56 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                                     if 'tokens' not in local_result:
                                         local_result['tokens'] = await self.count_tokens(local_result['content'])
                                 
-                                # Filter out URLs we've already seen
-                                filtered_local_results = []
-                                for result in local_results:
-                                    url = result.get("url", "")
-                                    if url and url not in initial_seen_urls:
-                                        filtered_local_results.append(result)
-                                        initial_seen_urls.add(url)
-                                fetch_content
+                                initial_results.extend(local_results)
                         except Exception as e:
                             logger.error(f"Knowledge base error: {e}")
                             await self.emit_message(f"*Knowledge base temporarily unavailable*\n")
-
+                    
+                    # FIXED: Initialize web_results to empty list at the start of each iteration
+                    web_results = []
+                    
                     # If we don't have enough local results, do web search
                     if len(local_results) < 2:  # Adjust threshold as needed
-                        web_results = await self.process_query(
-                            query,
-                            query_embedding,
-                            outline_embedding,
-                            None,
-                            summary_embedding,
-                        )
-                        
-                        # Filter out any URLs we've already seen in initial research
-                        filtered_results = []
-                        for result in web_results:
-                            url = result.get("url", "")
-                            if url and url not in initial_seen_urls:
-                                filtered_results.append(result)
-                                initial_seen_urls.add(url)  # Mark this URL as seen
-                            else:
-                                logger.info(
-                                    f"Filtering out repeated URL in initial research: {url}"
-                                )
-
-                        # If we filtered out all results, log it
-                        logger.debug(f"web_results length: {len(web_results)}")
-                        if web_results and not filtered_results:
-                            logger.info(
-                                f"All {len(web_results)} results filtered due to URL repetition in initial research"
+                        # Use academic priority if enabled
+                        if self.valves.ACADEMIC_PRIORITY:
+                            web_results = await self.search_with_academic_priority_forced(
+                                query, self.valves.SEARCH_RESULTS_PER_QUERY + 2
                             )
-                            # If all results were filtered, try to get at least one result by using the first one
-                            if web_results:
-                                filtered_results.append(web_results[0])
-                                logger.info(
-                                    f"Added back one result to ensure minimal research data"
-                                )
-
-                        # Add non-repeated results to our collection
-                        initial_results.extend(filtered_results)
+                            
+                            # Process web results
+                            processed_web_results = []
+                            for result in web_results:
+                                # Skip if already processed as academic result
+                                if result.get("source") in ["PubMed", "HAL", "SUDOC", "arXiv", "CrossRef", "PEPITE"]:
+                                    # Academic results are already processed
+                                    processed_web_results.append(result)
+                                    # Display academic result
+                                    await self.display_academic_result(result)
+                                else:
+                                    # Process regular web results
+                                    processed_result = await self.process_search_result(
+                                        result, query, query_embedding, outline_embedding, summary_embedding
+                                    )
+                                    if processed_result.get("valid", False):
+                                        processed_web_results.append(processed_result)
+                            
+                            web_results = processed_web_results
+                        else:
+                            web_results = await self.process_query(
+                                query,
+                                query_embedding,
+                                outline_embedding,
+                                None,
+                                summary_embedding,
+                            )
                         
-                        # Store new web results in knowledge base
-                        if filtered_results and self.valves.USE_KNOWLEDGE_BASE:
-                            try:
-                                logger.debug(f"Adding sources: {[r.get('url') for r in web_results]}")
-                                await self.knowledge_base.add_sources(filtered_results, query, session_id)
-                            except Exception as e:
-                                logger.error(f"Error storing in knowledge base: {e}")
+                        # Add successful results to our collection
+                        initial_results.extend(web_results)
+                        logger.debug(f"web_results length: {len(web_results)}")
                     else:
                         await self.emit_message(f"*Using local sources, skipping web search for: {query}*\n")
+                        logger.debug(f"web_results length: {len(web_results)} (no web search needed)")
 
-
-                    # Filter out any URLs we've already seen in initial research
-                    filtered_results = []
-                    for result in results:
-                        url = result.get("url", "")
-                        if url and url not in initial_seen_urls:
-                            filtered_results.append(result)
-                            initial_seen_urls.add(url)  # Mark this URL as seen
-                        else:
-                            logger.info(
-                                f"Filtering out repeated URL in initial research: {url}"
-                            )
-
-                    # If we filtered out all results, log it
-                    if results and not filtered_results:
-                        logger.info(
-                            f"All {len(results)} results filtered due to URL repetition in initial research"
-                        )
-                        # If all results were filtered, try to get at least one result by using the first one
-                        if results:
-                            filtered_results.append(results[0])
-                            logger.info(
-                                f"Added back one result to ensure minimal research data"
-                            )
-
-                    # Add non-repeated results to our collection
-                    initial_results.extend(filtered_results)
 
                 # Generate research outline that incorporates previous findings and new follow-up
                 await self.emit_status(
@@ -9712,32 +11154,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                     },
                 ]
 
-                # Generate the research outline
-                outline_response = await self.generate_completion(
-                    self.get_research_model(), outline_messages
-                )
-                outline_content = outline_response["choices"][0]["message"]["content"]
-
-                # Extract JSON from response
-                try:
-                    outline_json_str = outline_content[
-                                       outline_content.find("{"): outline_content.rfind("}") + 1
-                                       ]
-                    outline_data = json.loads(outline_json_str)
-                    research_outline = outline_data.get("outline", [])
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.error(f"Error parsing outline JSON: {e}")
-                    # Fallback: create a simple outline if JSON parsing fails
-                    research_outline = [
-                        {
-                            "topic": "Follow-up Information",
-                            "subtopics": ["Key Aspects", "New Developments"],
-                        },
-                        {
-                            "topic": "Extended Analysis",
-                            "subtopics": ["Additional Details", "Further Examples"],
-                        },
-                    ]
+                research_outline = await self.generate_research_outline_with_retry(user_message, outline_context)
 
                 # Create a flat list of all topics for tracking
                 all_topics = []
@@ -9868,7 +11285,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         except Exception as e:
                             logger.error(f"Knowledge base error: {e}")
                             await self.emit_message(f"*Knowledge base temporarily unavailable*\n")
-
+                    web_results = []
                     # If we don't have enough local results, do web search
                     if len(local_results) < 2:  # Adjust threshold as needed
                         web_results = await self.process_query(
@@ -9883,8 +11300,8 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                         initial_results.extend(web_results)
                         logger.debug(f"web_results length: {len(web_results)}")
 
-                    else:
-                        await self.emit_message(f"*Using local sources, skipping web search for: {query}*\n")
+                else:
+                    await self.emit_message(f"*Using local sources, skipping web search for: {query}*\n")
 
 
                 # Check if we got any useful results
@@ -10253,25 +11670,43 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
                 need_web_search = len(local_results) < self.valves.KB_LOCAL_SOURCES_THRESHOLD
                 
                 if need_web_search:
-                    # Process web search query
-                    web_results = await self.process_query(
-                        query,
-                        query_embedding,
-                        outline_embedding,
-                        None,
-                        summary_embedding,
-                    )
-                    
-                    # Add successful results to the cycle results
-                    cycle_results.extend(web_results)
-                    logger.debug(f"web_results length: {len(web_results)}")
- 
+                    web_results = []
+                    if self.valves.ACADEMIC_PRIORITY:
+                        web_results = await self.search_with_academic_priority_forced(query, self.valves.SEARCH_RESULTS_PER_QUERY + 2)
+                        
+                        # Process web results
+                        processed_web_results = []
+                        for result in web_results:
+                            # Skip if already processed as academic result
+                            if result.get("source") in ["PubMed", "HAL", "SUDOC", "arXiv", "CrossRef", "PEPITE"]:
+                                # Academic results are already processed, just add query info
+                                result['query'] = query
+                                result['topic'] = topic
+                                processed_web_results.append(result)
+                                
+                                # Display academic result
+                                await self.display_academic_result(result)
+                            else:
+                                # Process regular web results
+                                processed_result = await self.process_search_result(
+                                    result, query, query_embedding, outline_embedding, summary_embedding
+                                )
+                                if processed_result.get("valid", False):
+                                    processed_web_results.append(processed_result)
+                        
+                        # Add successful results to the cycle results
+                        cycle_results.extend(processed_web_results)
+                    else:
+                        # Use regular process_query method
+                        web_results = await self.process_query(
+                            query, query_embedding, outline_embedding, None, summary_embedding
+                        )
+                        cycle_results.extend(web_results)
+                        
                 else:
                     await self.emit_message(f"*Using local sources, skipping web search for cycle {cycle} query: {query}*\n")
 
-                # Add all results to history
-                results_history.extend(cycle_results)
-
+            results_history.extend(cycle_results)
             # Update in state
             self.update_state("results_history", results_history)
 
@@ -11111,7 +12546,10 @@ Format your response as a valid JSON object with the following structure:
                 logger.info(f"Context around first bibliography: ...{comprehensive_answer[start:end]}...")
 
         comprehensive_answer = await self.add_bibliography_once(comprehensive_answer, bibliography_table)
-
+            
+        if self.valves.ENABLE_FINAL_VERIFICATION:
+            comprehensive_answer = await self.verify_final_report(comprehensive_answer, user_message)
+        
         # Add research date
         comprehensive_answer += f"*Research conducted on: {self.research_date}*\n\n"
 
@@ -11183,6 +12621,246 @@ Format your response as a valid JSON object with the following structure:
         return ""
 
 
+import json
+import asyncio
+from openai import OpenAI
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+import json
+import asyncio
+from openai import OpenAI
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class StructuredResearchPlanner:
+    def __init__(self, base_url="http://localhost:1234/v1", api_key="lm-studio"):
+        """Initialize the OpenAI client pointing to LMStudio server"""
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key
+        )
+    
+    def create_research_outline_schema(self):
+        """Define the JSON schema for research outline"""
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "research_outline",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "research_outline": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "description": "Main research topic title"
+                                },
+                                "overview": {
+                                    "type": "string",
+                                    "description": "Brief overview of the research scope"
+                                },
+                                "main_sections": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "section_name": {
+                                                "type": "string",
+                                                "description": "Name of the research section"
+                                            },
+                                            "description": {
+                                                "type": "string",
+                                                "description": "Description of what this section covers"
+                                            },
+                                            "subsections": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "name": {
+                                                            "type": "string",
+                                                            "description": "Subsection name"
+                                                        },
+                                                        "focus": {
+                                                            "type": "string",
+                                                            "description": "What this subsection focuses on"
+                                                        },
+                                                        "priority": {
+                                                            "type": "string",
+                                                            "enum": ["high", "medium", "low"],
+                                                            "description": "Research priority level"
+                                                        }
+                                                    },
+                                                    "required": ["name", "focus", "priority"]
+                                                },
+                                                "minItems": 1
+                                            },
+                                            "research_questions": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "string"
+                                                },
+                                                "description": "Key research questions for this section",
+                                                "minItems": 1
+                                            }
+                                        },
+                                        "required": ["section_name", "description", "subsections", "research_questions"]
+                                    },
+                                    "minItems": 2,
+                                    "maxItems": 8
+                                },
+                                "methodology": {
+                                    "type": "object",
+                                    "properties": {
+                                        "search_strategy": {
+                                            "type": "string",
+                                            "description": "Overall search and research strategy"
+                                        },
+                                        "keywords": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "string"
+                                            },
+                                            "description": "Key search terms and phrases"
+                                        },
+                                        "source_types": {
+                                            "type": "array",
+                                            "items": {
+                                                "type": "string",
+                                                "enum": ["academic", "professional", "news", "government", "industry"]
+                                            },
+                                            "description": "Types of sources to prioritize"
+                                        }
+                                    },
+                                    "required": ["search_strategy", "keywords", "source_types"]
+                                }
+                            },
+                            "required": ["title", "overview", "main_sections", "methodology"]
+                        }
+                    },
+                    "required": ["research_outline"]
+                }
+            }
+        }
+    
+
+    
+    def convert_to_legacy_format(self, structured_outline):
+        """Convert structured outline to the legacy format your code expects"""
+        try:
+            research_outline = structured_outline.get("research_outline", {})
+            main_sections = research_outline.get("main_sections", [])
+            
+            legacy_format = []
+            
+            for section in main_sections:
+                section_name = section.get("section_name", "Unknown Section")
+                subsections = section.get("subsections", [])
+                
+                # Create subtopics list from subsections
+                subtopics = []
+                for subsection in subsections:
+                    subtopic_name = subsection.get("name", "Unknown Subtopic")
+                    subtopics.append(subtopic_name)
+                
+                # Ensure we have at least some subtopics
+                if not subtopics:
+                    subtopics = ["Key Aspects", "Analysis"]
+                
+                legacy_format.append({
+                    "topic": section_name,
+                    "subtopics": subtopics
+                })
+            
+            return legacy_format
+            
+        except Exception as e:
+            logger.error(f"Error converting to legacy format: {e}")
+            return self.create_legacy_fallback_outline("conversion_error")
+    
+    def create_legacy_fallback_outline(self, user_message):
+        """Create a fallback outline in the legacy format"""
+        return [
+            {
+                "topic": "Follow-up Information", 
+                "subtopics": ["Key Aspects", "New Developments"]
+            },
+            {
+                "topic": "Extended Analysis", 
+                "subtopics": ["Additional Details", "Further Examples"]
+            }
+        ]
+    
+    def extract_research_dimensions(self, outline):
+        """Extract research dimensions from the structured outline"""
+        dimensions = []
+        
+        try:
+            research_outline = outline.get("research_outline", {})
+            main_sections = research_outline.get("main_sections", [])
+            
+            for section in main_sections:
+                section_name = section.get("section_name", "")
+                subsections = section.get("subsections", [])
+                
+                # Add main section
+                dimensions.append({
+                    "name": section_name,
+                    "description": section.get("description", ""),
+                    "type": "main_section",
+                    "priority": "high"
+                })
+                
+                # Add subsections
+                for subsection in subsections:
+                    dimensions.append({
+                        "name": f"{section_name} - {subsection.get('name', '')}",
+                        "description": subsection.get("focus", ""),
+                        "type": "subsection",
+                        "priority": subsection.get("priority", "medium")
+                    })
+                    
+        except Exception as e:
+            logger.error(f"Error extracting dimensions: {e}")
+            
+        return dimensions
+    
+    def format_outline_for_display(self, outline):
+        """Format the structured outline for display"""
+        try:
+            research_outline = outline.get("research_outline", {})
+            
+            formatted = f"### {research_outline.get('title', 'Research Outline')}\n\n"
+            formatted += f"**Overview:** {research_outline.get('overview', '')}\n\n"
+            
+            main_sections = research_outline.get("main_sections", [])
+            for section in main_sections:
+                formatted += f"**{section.get('section_name', '')}**\n"
+                formatted += f"- {section.get('description', '')}\n"
+                
+                subsections = section.get("subsections", [])
+                for subsection in subsections:
+                    priority_icon = "🔥" if subsection.get("priority") == "high" else "📝"
+                    formatted += f"  {priority_icon} {subsection.get('name', '')}\n"
+                
+                formatted += "\n"
+            
+            return formatted
+            
+        except Exception as e:
+            logger.error(f"Error formatting outline: {e}")
+            return "### Research Outline\n*Error formatting outline*"
+
+
 class TrajectoryAccumulator:
     """Efficiently accumulates research trajectory across cycles"""
 
@@ -11220,3 +12898,24 @@ class TrajectoryAccumulator:
             return (trajectory / norm).tolist()
         else:
             return None
+
+
+# Example usage
+def main():
+    planner = StructuredResearchPlanner()
+    
+    # Example query
+    query = "exemples d'études sur la vision des médecins envers l'autodiagnostic"
+    
+    # Generate structured outline
+    outline = planner.generate_research_outline(query, context_sources=["source1", "source2", "source3"])
+    
+    # Display formatted outline
+    print(planner.format_outline_for_display(outline))
+    
+    # Extract dimensions for further processing
+    dimensions = planner.extract_research_dimensions(outline)
+    print(f"\nExtracted {len(dimensions)} research dimensions")
+
+if __name__ == "__main__":
+    main()

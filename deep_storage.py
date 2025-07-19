@@ -36,6 +36,27 @@ class ResearchKnowledgeBase:
         
         logger.info(f"Knowledge base initialized at: {db_path}")
         logger.info(f"Current collection size: {self.collection.count()}")
+   
+    
+    @staticmethod
+    def list_knowledge_bases(base_path: str = "./DBs/") -> List[str]:
+        """List all available knowledge base directories"""
+        import os
+        import glob
+        
+        # Look for directories ending with _knowledge_db
+        pattern = os.path.join(base_path, "*_knowledge_db")
+        db_dirs = glob.glob(pattern)
+        
+        # Extract just the database names (remove path and suffix)
+        db_names = []
+        for db_dir in db_dirs:
+            basename = os.path.basename(db_dir)
+            if basename.endswith("_knowledge_db"):
+                db_name = basename[:-13]  # Remove "_knowledge_db" suffix
+                db_names.append(db_name)
+        
+        return sorted(db_names)
     
     def _generate_source_id(self, url: str, title: str) -> str:
         """Generate unique ID for a source"""

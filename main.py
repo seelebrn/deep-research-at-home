@@ -5,9 +5,10 @@ import logging
 import time
 # Load environment variables
 load_dotenv()
-
+import argparse
 # Import your research class
 from deep_research import Pipe, User
+from deep_storage import ResearchKnowledgeBase
 
 # Set up logging
 logging.basicConfig(
@@ -15,11 +16,23 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Deep Research System")
+    parser.add_argument("--kn", "--knowledge", dest="knowledge_db", 
+                       help="Knowledge database name to use (default: research)")
+    parser.add_argument("--kn-list", "--knowledge-list", action="store_true",
+                       help="List available knowledge databases and exit")
+    return parser.parse_args()
+
 class InteractiveResearchSession:
-    def __init__(self):
+    def __init__(self, knowledge_db_name=None):
         self.pipe = Pipe()
+        self.knowledge_db_name = knowledge_db_name or "research"
         self.user = User(id="standalone_user", name="Research User", email="user@example.com")
         self.setup_valves()
+        # Initialize knowledge base with specified name
+        self.pipe.initialize_knowledge_base(self.knowledge_db_name)
         
     def setup_valves(self):
         """Override valves with environment variables"""
@@ -60,13 +73,15 @@ class InteractiveResearchSession:
         print("=" * 50)
         # FORCE CLEAN START - Add this section
         print("🧹 Ensuring clean start...")
-            # Create completely new pipe instance
-        from deep_research import Pipe
         fresh_pipe = Pipe()
+        # Create completely new pipe instance
         fresh_pipe.valves = self.pipe.valves
+        # Re-initialize knowledge base with same database name
+        fresh_pipe.initialize_knowledge_base(self.knowledge_db_name)
         self.pipe = fresh_pipe
     
         print("   ✅ Created fresh pipe instance")
+        print(f"   📚 Re-initialized knowledge base: {self.knowledge_db_name}")
         # Reset the pipe's conversation ID to force a new conversation
         if hasattr(self.pipe, 'conversation_id'):
             old_id = self.pipe.conversation_id
@@ -235,11 +250,33 @@ class InteractiveResearchSession:
             traceback.print_exc()
 async def main():
     """Main function to run the deep research system"""
+    # Parse command line arguments
+    args = parse_arguments()
+    
+    # Handle knowledge database listing
+    if args.kn_list:
+        print("🔬 Available Knowledge Databases:")
+        print("=" * 50)
+        
+        db_list = ResearchKnowledgeBase.list_knowledge_bases()
+        if db_list:
+            for i, db_name in enumerate(db_list, 1):
+                print(f"{i}. {db_name}")
+        else:
+            print("No knowledge databases found.")
+        
+        print("\nUse --kn <name> to specify a database")
+        return
+    
     print("🔬 Deep Research System")
     print("=" * 50)
     
-    # Create the session
-    session = InteractiveResearchSession()
+    # Display selected knowledge database
+    selected_db = args.knowledge_db or "research"
+    print(f"📚 Knowledge Database: {selected_db}")
+    
+    # Create the session with specified knowledge database
+    session = InteractiveResearchSession(selected_db)
     
     # CHECK THE CRITICAL SETTINGS
     print(f"🔧 INTERACTIVE_RESEARCH: {session.pipe.valves.INTERACTIVE_RESEARCH}")
