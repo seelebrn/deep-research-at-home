@@ -3,7 +3,7 @@
 # Also added functionality to prioritize certain domains and content
 # More info on github: https://github.com/atineiatte/deep-research-at-home
 # Make sure you use my gemma3 system prompt too
-
+import os
 import logging
 import json
 import math
@@ -22,6 +22,9 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from deep_storage import ResearchKnowledgeBase, DeepResearchIntegration
 from academia import AcademicAPIManager
+from report_quality_enhancer import minimal_clean_enhancement, enhance_report_quality_cleanly
+from pydantic import BaseModel, Field
+from typing import Literal
 name = "Deep Research by ~Cadenza"
 
 
@@ -273,7 +276,6 @@ class Pipe:
     __model__: str
     __request__: Any
     
-
     class Valves(BaseModel):
         ENABLED: bool = Field(
             default=True,
@@ -411,10 +413,9 @@ class Pipe:
             le=5000,
         )
         DOMAIN_PRIORITY: str = Field(
-            default="",
-            description="Comma or space-separated list of domain keywords to prioritize (e.g., '.gov, .edu, epa'). Leave empty to disable domain prioritization.",
+            default=os.getenv("DOMAIN_PRIORITY", ".edu,.gov,pubmed.ncbi.nlm.nih.gov,hal.science,openedition.org"),
+            description="Comma or space-separated list of domain keywords to prioritize"
         )
-
         CONTENT_PRIORITY: str = Field(
             default="",
             description="Comma or space-separated list of content keywords to prioritize (e.g., 'pfas, spatial, groundwater'). Leave empty to disable content prioritization.",
@@ -538,10 +539,6 @@ class Pipe:
             description="Prioritize academic databases (PubMed, HAL, PEPITE, etc.) over web search",
         )
         
-        ACADEMIC_DATABASES: str = Field(
-            default="pubmed,hal,openedition,pepite,theses,cairn,sudoc,arxiv,crossref",  # Added openedition
-            description="Comma-separated list of academic databases to search (pubmed,hal,pepite,sudoc,arxiv,crossref)",
-        )
         
         ACADEMIC_RESULTS_PER_QUERY: int = Field(
             default=3,
@@ -569,7 +566,7 @@ class Pipe:
             description="Email address for CrossRef API requests (required by their terms)",
         )
         VERIFICATION_MODEL: str = Field(
-            default="microsoft/phi-4-reasoning-plus",  # or "llama3.1:70b" for even better verification
+            default="qwen2.5-7b-longpo-128k-i1",  # or "llama3.1:70b" for even better verification
             description="Model for final report verification and quality control"
         )
         
@@ -602,7 +599,18 @@ class Pipe:
             default=True,
             description="Enable shs.cairn.info search for social sciences"
         )
-
+        # Report Enhancement Configuration
+        REPORT_ENHANCEMENT_LEVEL: Literal["null", "minimal", "clean", "complex"] = Field(
+            default="clean",
+            description=(
+                "Report enhancement level:\n"
+                "• null: No enhancement, return raw research report\n"
+                "• minimal: Light cleanup only (structure and formatting)\n"
+                "• clean: Balanced enhancement with quality improvements (recommended)\n"
+                "• complex: Advanced analysis with comprehensive improvements (slower)"
+            )
+        )
+    
 
     def __init__(self, base_url="http://localhost:1234/v1", api_key="lm-studio"):
         self.type = "manifold"
@@ -611,7 +619,7 @@ class Pipe:
         # Use state manager to isolate conversation states
         self.state_manager = ResearchStateManager()
         self.conversation_id = None  # Will be set during pipe method
-
+                
         # Shared resources (not conversation-specific)
         self.embedding_cache = EmbeddingCache(max_size=10000000)
         self.transformation_cache = TransformationCache(max_size=2500000)
@@ -620,7 +628,7 @@ class Pipe:
         self.is_pdf_content = False
         self.research_date = None
         self.trajectory_accumulator = None
-
+        self.report_enhancement_level = "clean"  # Default to clean enhancement
         self.research_date = datetime.now().strftime("%Y-%m-%d")
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.valves.THREAD_WORKERS
@@ -633,13 +641,6 @@ class Pipe:
             base_url=base_url,
             api_key=api_key
         )
-        if hasattr(self.valves, 'DOMAIN_PRIORITY'):
-            current_domains = self.valves.DOMAIN_PRIORITY
-            academic_domains = "pubmed.ncbi.nlm.nih.gov,hal.archives-ouvertes.fr,pepite-depot.univ-lille.fr,arxiv.org,sudoc.fr"
-            if current_domains and not any(domain in current_domains for domain in academic_domains.split(',')):
-                self.valves.DOMAIN_PRIORITY = f"{academic_domains},{current_domains}"
-            elif not current_domains:
-                self.valves.DOMAIN_PRIORITY = f"{academic_domains},.edu,.gov"
 
 
     async def search_with_academic_priority(self, query: str, max_results: int = 10) -> List[Dict]:
@@ -4117,7 +4118,7 @@ class Pipe:
                                             
                                             session_id = f"archive_{self.research_date}_{len(master_source_table)}"
                                             asyncio.create_task(
-                                                self.knowledge_base.add_sources([kb_source], "archive_fetch", session_id)
+                                                self.knowledge_base.add_sources([kb_source], "archive_fetch", session_id, self.valves.DOMAIN_PRIORITY)
                                             )
                                             logger.debug(f"Queued archived content for KB: {title[:50]}...")
                                     except Exception as e:
@@ -4199,7 +4200,7 @@ class Pipe:
                                             # Store asynchronously to avoid blocking
                                             session_id = f"fetch_{self.research_date}_{len(master_source_table)}"
                                             asyncio.create_task(
-                                                self.knowledge_base.add_sources([kb_source], "content_fetch", session_id)
+                                                self.knowledge_base.add_sources([kb_source], "content_fetch", session_id, self.valves.DOMAIN_PRIORITY)
                                             )
                                             logger.debug(f"Queued HTML content for KB: {title[:50]}...")
                                     except Exception as e:
@@ -4389,7 +4390,7 @@ class Pipe:
                                                 
                                                 session_id = f"fetch_{self.research_date}_{len(master_source_table)}"
                                                 asyncio.create_task(
-                                                    self.knowledge_base.add_sources([kb_source], "content_fetch", session_id)
+                                                    self.knowledge_base.add_sources([kb_source], "content_fetch", session_id, self.valves.DOMAIN_PRIORITY)
                                                 )
                                                 logger.debug(f"Queued PDF content for KB: {title[:50]}...")
                                         except Exception as e:
@@ -4466,7 +4467,7 @@ class Pipe:
                                                         
                                                         session_id = f"archive_{self.research_date}_{len(master_source_table)}"
                                                         asyncio.create_task(
-                                                            self.knowledge_base.add_sources([kb_source], "archive_fetch", session_id)
+                                                            self.knowledge_base.add_sources([kb_source], "archive_fetch", session_id, self.valves.DOMAIN_PRIORITY)
                                                         )
                                                         logger.debug(f"Queued archived content for KB: {title[:50]}...")
                                                 except Exception as e:
@@ -10755,6 +10756,75 @@ Focus on creating logical, well-structured sections with clear subsections and r
     def renumber_citations_in_content(self, content):
         """Placeholder - citations should already be properly numbered"""
         return content
+        
+    async def enhance_report_by_level(pipe_instance, comprehensive_answer: str, user_message: str, enhancement_level: str = None) -> str:
+        """
+        Apply report enhancement based on user's chosen level
+        Now compatible with Pydantic valves
+        """
+        
+        # Get enhancement level from valves if not provided
+        if enhancement_level is None:
+            enhancement_level = pipe_instance.valves.REPORT_ENHANCEMENT_LEVEL
+        
+        # Validate enhancement level (Pydantic should handle this, but double-check)
+        valid_levels = ['null', 'minimal', 'clean', 'complex']
+        if enhancement_level not in valid_levels:
+            logger.warning(f"Invalid enhancement level '{enhancement_level}', defaulting to 'clean'")
+            enhancement_level = 'clean'
+        
+        logger.info(f"Applying '{enhancement_level}' level report enhancement")
+        
+        # Check timeout setting
+        timeout = getattr(pipe_instance.valves, 'ENHANCEMENT_TIMEOUT_SECONDS', 300)
+        fallback_enabled = getattr(pipe_instance.valves, 'ENHANCEMENT_FALLBACK_ON_ERROR', True)
+        
+        try:
+            # Apply enhancement with timeout
+            result = await asyncio.wait_for(
+                _apply_enhancement_level(pipe_instance, comprehensive_answer, user_message, enhancement_level),
+                timeout=timeout
+            )
+            return result
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"Enhancement timeout after {timeout}s, falling back to minimal")
+            if fallback_enabled:
+                return await minimal_clean_enhancement(pipe_instance, comprehensive_answer, user_message)
+            else:
+                return comprehensive_answer
+                
+        except Exception as e:
+            logger.error(f"Error in {enhancement_level} enhancement: {e}")
+            if fallback_enabled:
+                logger.info("Falling back to minimal enhancement")
+                try:
+                    return await minimal_clean_enhancement(pipe_instance, comprehensive_answer, user_message)
+                except Exception as fallback_error:
+                    logger.error(f"Fallback enhancement failed: {fallback_error}")
+            return comprehensive_answer
+
+
+    async def _apply_enhancement_level(pipe_instance, comprehensive_answer: str, user_message: str, enhancement_level: str) -> str:
+        """Internal enhancement application function"""
+        
+        if enhancement_level == "null":
+            await pipe_instance.emit_status("info", "No enhancement applied - returning raw report", False)
+            return comprehensive_answer
+            
+        elif enhancement_level == "minimal":
+            await pipe_instance.emit_status("info", "Applying minimal enhancement...", False)
+            return await minimal_clean_enhancement(pipe_instance, comprehensive_answer, user_message)
+            
+        elif enhancement_level == "clean":
+            await pipe_instance.emit_status("info", "Applying clean enhancement...", False)
+            return await enhance_report_quality_cleanly(pipe_instance, comprehensive_answer, user_message)
+            
+        elif enhancement_level == "complex":
+            await pipe_instance.emit_status("info", "Applying complex enhancement...", False)
+            return await enhance_report_comprehensively_clean(pipe_instance, comprehensive_answer, user_message) 
+        
+        
     async def pipe(
             self,
             body: dict,
@@ -12546,7 +12616,34 @@ Format your response as a valid JSON object with the following structure:
                 logger.info(f"Context around first bibliography: ...{comprehensive_answer[start:end]}...")
 
         comprehensive_answer = await self.add_bibliography_once(comprehensive_answer, bibliography_table)
-            
+        # =================================
+        # QUALITY ENHANCEMENT PHASE
+        # =================================
+        if getattr(self.valves, 'ENABLE_QUALITY_ENHANCEMENT', True):
+            try:
+                await self.emit_status("info", "Enhancing report quality...", False)
+                
+                # Import and use the quality enhancer
+                from report_quality_enhancer import enhance_report_quality
+                
+                comprehensive_answer = await enhance_report_by_level(
+                    pipe_instance=self,
+                    comprehensive_answer=comprehensive_answer,
+                    user_message=user_message,
+                    enhancement_level=self.valves.REPORT_ENHANCEMENT_LEVEL  # This uses the Pydantic field
+                )
+                await self.emit_status(
+                "info", 
+                f"Report enhanced using '{self.valves.REPORT_ENHANCEMENT_LEVEL}' level", 
+                False
+                )
+                                
+                await self.emit_status("info", "Quality enhancement completed", False)
+                
+            except Exception as e:
+                logger.error(f"Quality enhancement failed: {e}")
+                await self.emit_status("warning", "Quality enhancement failed - proceeding with original", False)
+        
         if self.valves.ENABLE_FINAL_VERIFICATION:
             comprehensive_answer = await self.verify_final_report(comprehensive_answer, user_message)
         

@@ -1373,11 +1373,10 @@ class AcademicAPIManager:
             ("theses", self.search_theses_fr),
             ("cairn", self.search_cairn),
             ("sudoc", self.search_sudoc),
-            ("arxiv", self.search_arxiv),
         ]
         
         # Filter based on enabled databases
-        enabled_databases = getattr(self.pipe.valves, 'ACADEMIC_DATABASES', 'pubmed,hal,openedition,pepite,theses,cairn,arxiv,crossref').split(',')
+        enabled_databases = getattr(self.pipe.valves, 'ACADEMIC_DATABASES', 'pubmed,hal,openedition,pepite,theses,cairn,crossref').split(',')
         enabled_databases = [db.strip().lower() for db in enabled_databases]
             
         # Filter sources

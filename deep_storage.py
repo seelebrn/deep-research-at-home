@@ -89,9 +89,9 @@ class ResearchKnowledgeBase:
         except:
             return "unknown"
     
-    async def add_sources(self, sources: List[Dict], research_query: str = "", session_id: str = "") -> int:
+    async def add_sources(self, sources: List[Dict], research_query: str = "", session_id: str = "", domain_priority: str = "") -> int:
         """
-        Add multiple sources to the knowledge base
+        Add multiple sources to the knowledge base (filtered by scientific domains)
         
         Args:
             sources: List of source dictionaries with keys: url, title, content, etc.
@@ -103,8 +103,17 @@ class ResearchKnowledgeBase:
         """
         if not sources:
             return 0
+        
+        scientific_domains = []
+        if domain_priority and domain_priority.strip():
+            # Split on comma first, then clean each domain
+            scientific_domains = [domain.strip().lower() for domain in domain_priority.split(',') if domain.strip()]
+            logger.info(f"Domain priority filter active: {scientific_domains}")
+        else:
+            logger.info("No domain priority specified, adding all sources")
             
         added_count = 0
+        filtered_count = 0
         current_time = datetime.now().isoformat()
         
         # Prepare data for ChromaDB
@@ -122,6 +131,16 @@ class ResearchKnowledgeBase:
                 # Skip if no meaningful content
                 if not content or len(content.strip()) < 100:
                     continue
+                
+                # Apply domain filtering if priority domains are specified
+                if scientific_domains:
+                    url_lower = url.lower()
+                    is_scientific = any(domain in url_lower for domain in scientific_domains)
+                    
+                    if not is_scientific:
+                        filtered_count += 1
+                        logger.debug(f"Filtered out non-scientific source: {title[:50]}... from {url}")
+                        continue
                 
                 # Clean content
                 clean_content = self._clean_content(content)
@@ -168,10 +187,15 @@ class ResearchKnowledgeBase:
                     metadatas=metadatas,
                     ids=ids
                 )
-                logger.info(f"Successfully added {added_count} sources to knowledge base")
+                logger.info(f"Successfully added {added_count} scientific sources to knowledge base")
+                if filtered_count > 0:
+                    logger.info(f"Filtered out {filtered_count} non-scientific sources")
             except Exception as e:
                 logger.error(f"Error adding sources to ChromaDB: {e}")
                 return 0
+        else:
+            if filtered_count > 0:
+                logger.info(f"No sources added - all {filtered_count} sources were filtered out (non-scientific)")
         
         return added_count
     
@@ -325,7 +349,7 @@ class DeepResearchIntegration:
     def __init__(self, knowledge_base: ResearchKnowledgeBase):
         self.kb = knowledge_base
     
-    async def enhance_research_process(self, query: str, web_search_function, min_local_sources: int = 3):
+    async def enhance_research_process(self, query: str, web_search_function, min_local_sources: int = 3, domain_priority: str = ""):
         """
         Enhanced research process that checks local DB first
         
@@ -333,6 +357,7 @@ class DeepResearchIntegration:
             query: Research query
             web_search_function: Function to perform web search
             min_local_sources: Minimum local sources before web search
+            domain_priority: Domain priority string from valve
             
         Returns:
             Combined results from local and web sources
@@ -349,10 +374,11 @@ class DeepResearchIntegration:
             logger.info("Insufficient local sources, performing web search...")
             web_results = await web_search_function(query)
             
-            # Store new web results in knowledge base
+            # Store new web results in knowledge base (with domain filtering)
             if web_results:
                 session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-                await self.kb.add_sources(web_results, query, session_id)
+                added_count = await self.kb.add_sources(web_results, query, session_id, domain_priority)
+                logger.info(f"Added {added_count} new sources to knowledge base (domain filtered)")
             
             # Combine results
             combined_results = local_results + web_results
@@ -361,11 +387,11 @@ class DeepResearchIntegration:
             combined_results = local_results
         
         return combined_results
-    
-    async def store_research_session(self, results: List[Dict], query: str) -> int:
-        """Store results from a research session"""
+
+    async def store_research_session(self, results: List[Dict], query: str, domain_priority: str = "") -> int:
+        """Store results from a research session (with domain filtering)"""
         session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        return await self.kb.add_sources(results, query, session_id)
+        return await self.kb.add_sources(results, query, session_id, domain_priority)
 
 # Example usage and testing
 async def main():
