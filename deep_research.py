@@ -379,8 +379,8 @@ class Pipe:
         SYNTHESIS_TEMPERATURE: float = Field(
             default=0.6, description="Temperature for final synthesis", ge=0.0, le=2.0
         )
-        OLLAMA_URL: str = Field(
-            default="http://localhost:1234", description="URL for Ollama API"
+        LM_STUDIO_URL: str = Field(
+            default="http://localhost:1234", description="URL for LM_STUDIO_URL API"
         )
         SEARCH_URL: str = Field(
             default="http://127.0.0.1:8888/search?q=",
@@ -539,6 +539,10 @@ class Pipe:
             description="Prioritize academic databases (PubMed, HAL, PEPITE, etc.) over web search",
         )
         
+        ACADEMIC_DATABASES: str = Field(
+            default="pubmed,hal,openedition,pepite,theses,cairn,sudoc,crossref",  # Added openedition
+            description="Comma-separated list of academic databases to search (pubmed,hal,pepite,sudoc,crossref)",
+        )
         
         ACADEMIC_RESULTS_PER_QUERY: int = Field(
             default=3,
@@ -970,7 +974,7 @@ class Pipe:
 
                 # Try LMStudio/OpenAI format first
                 async with session.post(
-                    f"{self.valves.OLLAMA_URL}/v1/embeddings", 
+                    f"{self.valves.LM_STUDIO_URL}/v1/embeddings", 
                     json=payload, 
                     timeout=30
                 ) as response:
@@ -5978,7 +5982,7 @@ Reply with JUST "Yes" or "No" - no explanation or other text.""",
             connector = aiohttp.TCPConnector(force_close=True)
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.post(
-                        f"{self.valves.OLLAMA_URL}/v1/chat/completions",
+                        f"{self.valves.LM_STUDIO_URL}/v1/chat/completions",
                         json=payload,
                         timeout=300  # 5 minute timeout
                 ) as response:
@@ -10349,7 +10353,7 @@ Format your response as a valid JSON object with the following structure:
 
 
     async def unload_model(self, model_name: str):
-        """Unload a model to free memory (LMStudio/Ollama compatible)"""
+        """Unload a model to free memory (LMStudio compatible)"""
         try:
             # For LMStudio, you might need to call a specific endpoint
             # This is a placeholder - adjust based on your setup
@@ -10359,7 +10363,7 @@ Format your response as a valid JSON object with the following structure:
                 try:
                     payload = {"model": model_name}
                     async with session.post(
-                        f"{self.valves.OLLAMA_URL}/v1/models/unload", 
+                        f"{self.valves.LM_STUDIO_URL}/v1/models/unload", 
                         json=payload, 
                         timeout=10
                     ) as response:
@@ -10369,10 +10373,10 @@ Format your response as a valid JSON object with the following structure:
                 except:
                     pass
                 
-                # Try Ollama unload endpoint
+                # Try LM_STUDIO_URL unload endpoint
                 try:
                     async with session.delete(
-                        f"{self.valves.OLLAMA_URL}/api/generate",
+                        f"{self.valves.LM_STUDIO_URL}/api/generate",
                         json={"model": model_name, "keep_alive": 0},
                         timeout=10
                     ) as response:

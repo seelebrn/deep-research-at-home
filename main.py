@@ -37,7 +37,7 @@ class InteractiveResearchSession:
     def setup_valves(self):
         """Override valves with environment variables"""
         if os.getenv('LM_STUDIO_URL'):
-            self.pipe.valves.OLLAMA_URL = os.getenv('LM_STUDIO_URL')
+            self.pipe.valves.LM_STUDIO_URL = os.getenv('LM_STUDIO_URL')
         if os.getenv('RESEARCH_MODEL'):
             self.pipe.valves.RESEARCH_MODEL = os.getenv('RESEARCH_MODEL')
         if os.getenv('SYNTHESIS_MODEL'):
