@@ -23,6 +23,8 @@ def parse_arguments():
                        help="Knowledge database name to use (default: research)")
     parser.add_argument("--kn-list", "--knowledge-list", action="store_true",
                        help="List available knowledge databases and exit")
+    parser.add_argument("--query", dest="research_query",
+                       help="Research query to execute directly (skip interactive input)")
     return parser.parse_args()
 
 class InteractiveResearchSession:
@@ -158,7 +160,7 @@ class InteractiveResearchSession:
             # Step 3: Handle feedback if needed
             if waiting_for_feedback:
                 print("\n📋 FEEDBACK TIME!")
-                user_feedback = input("Your feedback: ").strip()
+                user_feedback = input("Your feedback (or press Enter to continue): ").strip()
                 
                 if not user_feedback:
                     user_feedback = "continue"
@@ -248,6 +250,7 @@ class InteractiveResearchSession:
             print("Stack trace:")
             import traceback
             traceback.print_exc()
+
 async def main():
     """Main function to run the deep research system"""
     # Parse command line arguments
@@ -271,7 +274,7 @@ async def main():
     print("🔬 Deep Research System")
     print("=" * 50)
     
-    # Display selected knowledge database
+    # Use the knowledge database from command line args (no asking)
     selected_db = args.knowledge_db or "research"
     print(f"📚 Knowledge Database: {selected_db}")
     
@@ -281,6 +284,7 @@ async def main():
     # CHECK THE CRITICAL SETTINGS
     print(f"🔧 INTERACTIVE_RESEARCH: {session.pipe.valves.INTERACTIVE_RESEARCH}")
     print(f"🔧 ENABLED: {session.pipe.valves.ENABLED}")
+    
     # Test embedding before research
     print("🧪 Testing embedding API...")
     test_embedding = await session.pipe.get_embedding("test methadone france")
@@ -288,11 +292,17 @@ async def main():
         print(f"   ✅ Embedding API working: {len(test_embedding)} dimensions")
     else:
         print(f"   ❌ Embedding API failed")
-    user_query = input("Enter your research question: ").strip()
     
-    if not user_query:
-        print("No query provided. Exiting.")
-        return
+    # Get query from command line args or prompt user
+    if args.research_query:
+        user_query = args.research_query
+        print(f"🎯 Using query from command line: {user_query}")
+    else:
+        user_query = input("Enter your research question: ").strip()
+        
+        if not user_query:
+            print("No query provided. Exiting.")
+            return
     
     await session.run_research(user_query)
 

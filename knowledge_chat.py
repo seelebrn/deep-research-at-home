@@ -37,17 +37,17 @@ class KnowledgeChat:
         self.embedding_model = embedding_model
         self.max_context_sources = max_context_sources
         self.similarity_threshold = similarity_threshold
+        self.knowledge_db_name = knowledge_db_name
         
-        
+        # Set up knowledge base path
         if knowledge_db_name == "research":
             db_path = "./DBs/research_knowledge_db"
         else:
             db_path = f"./DBs/{knowledge_db_name}_knowledge_db"
-        self.knowledge_base = ResearchKnowledgeBase()
             
         # Initialize knowledge base
         self.knowledge_base = ResearchKnowledgeBase(db_path=db_path)
-        self.knowledge_db_name = knowledge_db_name        
+        
         # Chat history
         self.conversation_history = []
         
@@ -297,6 +297,7 @@ async def main():
                        help="List available knowledge databases and exit")
    
     args = parser.parse_args()
+    
     # Handle knowledge database listing
     if args.kn_list:
         print("🧠 Available Knowledge Databases:")
@@ -326,13 +327,15 @@ async def main():
         chat_model = args.chat_model
         embedding_model = args.embedding_model
 
-
-    # Display selected knowledge database
+    # Use the knowledge database from command line args (no asking)
     selected_db = args.knowledge_db or "research"
-    print(f"🧠 Knowledge Chat - Database: {selected_db}")
-    print("=" * 50)
     
-    # Initialize and run chat
+    print(f"🧠 Knowledge Chat")
+    print("=" * 50)
+    print(f"📚 Database: {selected_db}")
+    print()
+    
+    # Initialize and run chat directly
     chat = KnowledgeChat(
         lm_studio_url=lm_studio_url,
         chat_model=chat_model,
