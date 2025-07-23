@@ -29,7 +29,7 @@ Query Analysis → Feedback Loop → Source Discovery → Compression → Export
 ```
 
 ### Key Components
-
+- **`start.py`**: Your friendly neighborhood entry point. For new users, use python start.py !
 - **`deep_research.py`**: Core research pipeline and orchestration
 - **`academia.py`**: Academic database integrations (PubMed, HAL, PEPITE, etc.)
 - **`deep_storage.py`**: ChromaDB-based knowledge persistence
