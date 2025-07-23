@@ -1,0 +1,6 @@
+# Environment files with actual secrets
+.env
+
+# But allow templates
+!.env.template
+!.env.example
