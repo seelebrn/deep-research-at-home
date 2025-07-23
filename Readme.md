@@ -1,5 +1,7 @@
 # Deep Research System
 
+Note : This readme is likely outdated on some points. Things are changing too fast. But I'll eventually update it. In the meantime, the new installer.bat *could* be a useful replacement (1-click install script - untested). 
+
 Important Acknowledgement : This project is based on - and reuses code from - atineiatte's (https://github.com/atineiatte) Deep Research At Home (https://github.com/atineiatte/deep-research-at-home)
 
 An AI-powered academic research automation system that conducts comprehensive, multi-cycle research with intelligent source discovery, semantic analysis, and structured synthesis.
